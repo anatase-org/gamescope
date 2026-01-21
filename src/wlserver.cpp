@@ -1867,9 +1867,8 @@ int wlsession_open_kms( const char *device_name, wlsession_kms_device_selector s
 
 	blank_unused_kms_devices();
 
-	struct wl_listener *listener = new wl_listener();
-	listener->notify = kms_device_handle_change;
-	wl_signal_add( &wlserver.wlr.device->events.change, listener );
+	wlserver.wlr.device_change_listener.notify = kms_device_handle_change;
+	wl_signal_add( &wlserver.wlr.device->events.change, &wlserver.wlr.device_change_listener );
 
 	return wlserver.wlr.device->fd;
 }
@@ -1879,9 +1878,10 @@ void wlsession_close_kms()
 	if ( wlserver.wlr.device )
 	{
 		wl_list_remove( &wlserver.wlr.device_change_listener.link );
+		wlr_session_close_file( wlserver.wlr.session, wlserver.wlr.device );
 	}
-	wlr_session_close_file( wlserver.wlr.session, wlserver.wlr.device );
 	s_kmsDevices.clear();
+	wlserver.wlr.device = nullptr;
 }
 
 #endif

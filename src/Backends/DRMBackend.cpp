@@ -24,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -186,6 +187,13 @@ static void drm_close_in_fences( struct drm_t *drm )
 		close( nFd );
 	drm->m_InFenceFdsInRequest.clear();
 }
+// Flip handler thread control. Keep the thread object global so we
+// can join it during shutdown instead of detaching and risking the
+// thread still using the DRM fd while we clean up.
+static std::thread g_page_flip_handler_thread;
+static std::atomic<bool> g_page_flip_handler_thread_should_exit{false};
+
+static int g_page_flip_pipe_fds[2] = { -1, -1 };
 
 namespace gamescope
 {
@@ -857,25 +865,44 @@ void flip_handler_thread_run(void)
 {
 	pthread_setname_np( pthread_self(), "gamescope-kms" );
 
-	struct pollfd pollfd = {
-		.fd = g_DRM.fd,
-		.events = POLLIN,
-	};
+	// Prepare pollfds: one for DRM fd and one for the pipe read end to
+	// detect when the write end is closed (POLLHUP) to exit.
+	struct pollfd fds[2];
+	int nfds = 0;
 
-	while ( true )
+	fds[nfds].fd = g_DRM.fd;
+	fds[nfds].events = POLLIN;
+	nfds++;
+
+	fds[nfds].fd = g_page_flip_pipe_fds[0];
+	fds[nfds].events = POLLIN;
+	nfds++;
+
+	while ( !g_page_flip_handler_thread_should_exit.load( std::memory_order_acquire ) )
 	{
-		int ret = poll( &pollfd, 1, -1 );
+		int ret = poll( fds, nfds, -1 );
 		if ( ret < 0 ) {
+			if ( errno == EINTR )
+				continue;
 			drm_log.errorf_errno( "polling for DRM events failed" );
 			break;
 		}
 
-		drmEventContext evctx = {
-			.version = 3,
-			.page_flip_handler2 = page_flip_handler,
-		};
-		drmHandleEvent(g_DRM.fd, &evctx);
+		// Check if the pipe read end got POLLHUP (write end closed) to exit.
+		if ( fds[1].revents & (POLLIN | POLLHUP) ) {
+			break;
+		}
+
+		if ( (fds[0].revents & POLLIN) ) {
+			drmEventContext evctx = {
+				.version = 3,
+				.page_flip_handler2 = page_flip_handler,
+			};
+			drmHandleEvent( g_DRM.fd, &evctx );
+		}
 	}
+
+	drm_log.debugf("page_flip_handler_thread exiting");
 }
 
 static bool refresh_state( drm_t *drm )
@@ -1491,8 +1518,15 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 		}
 	}
 
-	std::thread flip_handler_thread( flip_handler_thread_run );
-	flip_handler_thread.detach();
+	// Create a pipe to wake the flip handler poll for immediate exit.
+	// Closing the write end will cause the read end to get POLLHUP.
+	if ( pipe2( g_page_flip_pipe_fds, O_CLOEXEC ) != 0 ) {
+		drm_log.errorf_errno( "page-flip pipe creation failed" );
+		return false;
+	}
+
+	g_page_flip_handler_thread_should_exit = false;
+	g_page_flip_handler_thread = std::thread( flip_handler_thread_run );
 
 	// Set log priority to the max, liftoff_log_scope will filter for us.
 	liftoff_log_set_priority(LIFTOFF_DEBUG);
@@ -1651,6 +1685,22 @@ void finish_drm(struct drm_t *drm)
 	}
 	drmModeAtomicFree(req);
 
+	// Signal the page-flip handler thread to exit and join it so it won't be
+	// using the DRM fd while we clean it up. Closing the pipe write end
+	// causes the read end to get POLLHUP, waking the thread.
+	if ( g_page_flip_handler_thread.joinable() ) {
+		g_page_flip_handler_thread_should_exit.store( true, std::memory_order_release );
+
+		close( g_page_flip_pipe_fds[1] );
+		g_page_flip_pipe_fds[1] = -1;
+
+		g_page_flip_handler_thread.join();
+
+		close( g_page_flip_pipe_fds[0] );
+		g_page_flip_pipe_fds[0] = -1;
+	}
+
+
 	free(drm->device_name);
 
 	wlr_drm_format_set_finish( &drm->formats );
@@ -1682,8 +1732,8 @@ void finish_drm(struct drm_t *drm)
 
 
 
-	// We can't close the DRM FD here, it might still be in use by the
-	// page-flip handler thread.
+	wlsession_close_kms();
+	g_DRM.fd = -1;
 }
 
 gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *drm, struct wlr_dmabuf_attributes *dma_buf )
