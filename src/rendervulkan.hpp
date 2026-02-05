@@ -990,6 +990,7 @@ public:
 	inline bool supportsStorageImageReadWithoutFormat() { return m_bSupportsStorageImageReadWithoutFormat; }
 	inline bool supportsStorageImageWriteWithoutFormat() { return m_bSupportsStorageImageWriteWithoutFormat; }
 	inline uint32_t vendorID() {return m_uVendorID;}
+	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
 
 	inline std::pair<void *, uint32_t> uploadBufferData(uint32_t size, uint32_t alignment = 16)
 	{
@@ -1087,6 +1088,9 @@ protected:
 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
+
+private:
+	std::vector<VkExtensionProperties> m_supportedExts;
 };
 
 struct TextureState
@@ -1199,5 +1203,8 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_flat_texture( uint32_t width, 
 bool vulkan_supports_hdr10();
 
 void vulkan_wait_idle();
+
+// Whether the driver implements VK_EXT_physical_device_drm
+bool vulkan_has_drm_props();
 
 extern CVulkanDevice g_device;
