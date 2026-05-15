@@ -117,7 +117,7 @@ if get_option('enable_gamescope')
   subdir('src')
 endif
 
-if get_option('enable_gamescope')
+if get_option('enable_tests') and get_option('enable_gamescope')
   subdir('tests')
 endif
 
