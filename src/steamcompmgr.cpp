@@ -43,7 +43,6 @@
 #include <condition_variable>
 #include <mutex>
 #include <atomic>
-#include <vector>
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -53,7 +52,6 @@
 #include <string_view>
 #include <queue>
 #include <filesystem>
-#include <variant>
 #include <unordered_set>
 
 #include <assert.h>
@@ -5264,143 +5262,6 @@ get_name_from_pid( pid_t pid )
 	return procNameStr;
 }
 
-static uint32_t
-get_appid_from_pid_environ( pid_t pid )
-{
-	char filename[256];
-	snprintf( filename, sizeof( filename ), "/proc/%i/environ", pid );
-	std::ifstream proc_environ_file( filename, std::ios::binary );
-
-	if ( !proc_environ_file.is_open() || proc_environ_file.bad() )
-		return 0;
-
-	constexpr std::string_view sSteamAppIdPrefix = "SteamAppId=";
-	constexpr std::string_view sSteamCompatAppIdPrefix = "STEAM_COMPAT_APP_ID=";
-	std::string variable;
-
-	while ( std::getline( proc_environ_file, variable, '\0' ) )
-	{
-		std::string_view value = variable;
-		if ( value.starts_with( sSteamAppIdPrefix ) )
-		{
-			value.remove_prefix( sSteamAppIdPrefix.length() );
-		}
-		else if ( value.starts_with( sSteamCompatAppIdPrefix ) )
-		{
-			value.remove_prefix( sSteamCompatAppIdPrefix.length() );
-		}
-		else
-		{
-			continue;
-		}
-
-		uint32_t unAppId = 0;
-		auto [ ptr, error ] = std::from_chars( value.data(), value.data() + value.length(), unAppId );
-		if ( error == std::errc{} && ptr == value.data() + value.length() && unAppId != 0 )
-			return unAppId;
-	}
-
-	return 0;
-}
-
-uint32_t
-get_appid_from_pid( pid_t pid )
-{
-	uint32_t unFoundAppId = 0;
-
-	char filename[256];
-	pid_t next_pid = pid;
-
-	while ( 1 )
-	{
-		// SteamAppId and STEAM_COMPAT_APP_ID are authoritative when present.
-		// They can survive the Flatpak portal subsandbox boundary even though the
-		// game's process ancestry no longer reaches Steam's reaper process.
-		if ( uint32_t unEnvironmentAppId = get_appid_from_pid_environ( next_pid ) )
-			return unEnvironmentAppId;
-
-		snprintf( filename, sizeof( filename ), "/proc/%i/stat", next_pid );
-		std::ifstream proc_stat_file( filename );
-
-		if (!proc_stat_file.is_open() || proc_stat_file.bad())
-			break;
-
-		std::string proc_stat;
-
-		std::getline( proc_stat_file, proc_stat );
-
-		char *procName = nullptr;
-		char *lastParens = nullptr;
-
-		for ( uint32_t i = 0; i < proc_stat.length(); i++ )
-		{
-			if ( procName == nullptr && proc_stat[ i ] == '(' )
-			{
-				procName = &proc_stat[ i + 1 ];
-			}
-
-			if ( proc_stat[ i ] == ')' )
-			{
-				lastParens = &proc_stat[ i ];
-			}
-		}
-
-		if (!lastParens)
-			break;
-
-		*lastParens = '\0';
-		char state;
-		int parent_pid = -1;
-
-		sscanf( lastParens + 1, " %c %d", &state, &parent_pid );
-
-		if ( strcmp( "reaper", procName ) == 0 )
-		{
-			snprintf( filename, sizeof( filename ), "/proc/%i/cmdline", next_pid );
-			std::ifstream proc_cmdline_file( filename );
-			std::string proc_cmdline;
-
-			bool bSteamLaunch = false;
-			uint32_t unAppId = 0;
-
-			std::getline( proc_cmdline_file, proc_cmdline );
-
-			for ( uint32_t j = 0; j < proc_cmdline.length(); j++ )
-			{
-				if ( proc_cmdline[ j ] == '\0' && j + 1 < proc_cmdline.length() )
-				{
-					if ( strcmp( "SteamLaunch", &proc_cmdline[ j + 1 ] ) == 0 )
-					{
-						bSteamLaunch = true;
-					}
-					else if ( sscanf( &proc_cmdline[ j + 1 ], "AppId=%u", &unAppId ) == 1 && unAppId != 0 )
-					{
-						if ( bSteamLaunch == true )
-						{
-							unFoundAppId = unAppId;
-						}
-					}
-					else if ( strcmp( "--", &proc_cmdline[ j + 1 ] ) == 0 )
-					{
-						break;
-					}
-				}
-			}
-		}
-
-		if ( parent_pid == -1 || parent_pid == 0 )
-		{
-			break;
-		}
-		else
-		{
-			next_pid = parent_pid;
-		}
-	}
-
-	return unFoundAppId;
-}
-
 static pid_t
 get_win_pid(xwayland_ctx_t *ctx, Window id)
 {
@@ -5490,7 +5351,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
 	{
 		if ( new_win->pid != -1 )
 		{
-			new_win->appID = get_appid_from_pid( new_win->pid );
+			new_win->appID = gamescope::Process::GetAppIdFromPid( new_win->pid );
 		}
 		else
 		{
