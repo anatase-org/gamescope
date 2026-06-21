@@ -25,7 +25,9 @@ extern int g_nOutputRefresh; // mHz
 extern long g_nsVsync;       // ns
 extern bool g_bOutputHDREnabled;
 extern bool g_bForceInternal;
-extern bool g_bEnableDRMRotationShader;
+
+extern bool g_bForceCompositionRotation;
+extern uint32_t g_uOutputRotation;
 
 extern bool g_bFullscreen;
 

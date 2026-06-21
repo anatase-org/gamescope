@@ -28,6 +28,7 @@ uniform layers_t {
     float u_nitsToLinear;
     float u_itmSdrNits;
     float u_itmTargetNits;
+    uint u_rotation;
 };
 
 #include "composite.h"
@@ -70,11 +71,12 @@ vec4 sampleLayer(uint layerIdx, vec2 uv)
 
 void rcasComposite(uvec2 pos)
 {
+    if (any(greaterThanEqual(pos, outputLogicalSize(u_rotation)))) return;
     vec3 outputValue = vec3(0.0f);
 
     if (c_fsr_simple_output) {
         runRcas(outputValue, pos);
-        imageStore(dst, ivec2(pos), vec4(outputValue, 0));
+        imageStore(dst, rotateOutputCoord(pos, u_rotation), vec4(outputValue, 0));
         return;
     }
 
@@ -121,10 +123,10 @@ void rcasComposite(uvec2 pos)
     }
 
     outputValue = encodeOutputColor(outputValue);
-    imageStore(dst, ivec2(pos), vec4(outputValue, 0));
+    imageStore(dst, rotateOutputCoord(pos, u_rotation), vec4(outputValue, 0));
 
     if (checkDebugFlag(compositedebug_Markers))
-        compositing_debug(pos);
+        compositing_debug(pos, u_rotation);
 }
 
 void main()

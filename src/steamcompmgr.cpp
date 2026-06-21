@@ -1030,6 +1030,7 @@ global_focus_t *GetFocusForWindow( steamcompmgr_win_t *w )
 
 uint32_t		currentOutputWidth, currentOutputHeight;
 int 			currentOutputRefresh;
+uint32_t		currentOutputRotation = 0;
 bool			currentHDROutput = false;
 bool			currentHDRSupport = false;
 bool			currentHDRForce = false;
@@ -3462,6 +3463,15 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 		if ( drmCaptureFormat != DRM_FORMAT_INVALID )
 			pScreenshotTexture = vulkan_acquire_screenshot_texture( uScreenshotWidth, uScreenshotHeight, false, drmCaptureFormat );
 
+		// Logical-sized scratch keeps NV12 captures unrotated and off the live output image.
+		gamescope::Rc<CVulkanTexture> pRGBTexture;
+		if ( pScreenshotTexture && drmCaptureFormat == DRM_FORMAT_NV12 )
+		{
+			pRGBTexture = vulkan_acquire_capture_texture( g_nOutputWidth, g_nOutputHeight, false, vulkan_get_rgb10_capture_format() );
+			if ( !pRGBTexture )
+				pScreenshotTexture = nullptr;
+		}
+
 		if ( pScreenshotTexture )
 		{
 			bool bHDRScreenshot = path.extension() == ".avif" &&
@@ -3523,7 +3533,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 
 			std::optional<uint64_t> oScreenshotSeq;
 			if ( drmCaptureFormat == DRM_FORMAT_NV12 )
-				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, pScreenshotTexture, false, nullptr );
+				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, pScreenshotTexture, false, pRGBTexture );
 			else if ( oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_FULL_COMPOSITION ||
 					  oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
 				oScreenshotSeq = vulkan_composite( &screenshotFrameInfo, nullptr, false, pScreenshotTexture );
@@ -10331,7 +10341,9 @@ steamcompmgr_main(int argc, char **argv)
 		if ( currentOutputWidth != g_nOutputWidth ||
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
-			 currentHDROutput != g_bOutputHDREnabled )
+			 currentOutputRotation != g_uOutputRotation ||
+			 currentHDROutput != g_bOutputHDREnabled ||
+			 currentHDRForce != g_bForceHDRSupportDebug )
 		{
 			if ( g_nXWaylandCount > 1 )
 			{
@@ -10358,6 +10370,7 @@ steamcompmgr_main(int argc, char **argv)
 			currentOutputWidth = g_nOutputWidth;
 			currentOutputHeight = g_nOutputHeight;
 			currentOutputRefresh = g_nOutputRefresh;
+			currentOutputRotation = g_uOutputRotation;
 			currentHDROutput = g_bOutputHDREnabled;
 
 #if HAVE_PIPEWIRE

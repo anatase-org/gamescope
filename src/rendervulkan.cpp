@@ -65,7 +65,6 @@
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
 #include "cs_rgb_to_nv12.h"
-#include "cs_rotation.h"
 #include "cs_sgsr.h"
 
 gamescope::ConVar<bool> cv_raster_damage("raster_damage", true, "Reuse input shadows and output contents outside client damage.");
@@ -1191,7 +1190,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(NIS, cs_nis);
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
-	SHADER(ROTATION, cs_rotation);
+
 	SHADER(SGSR, cs_sgsr);
 #undef SHADER
 
@@ -1525,7 +1524,7 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	SHADER(EASU_RGBA16F, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
-	SHADER(ROTATION, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
+
 	SHADER(SGSR, 1, 1, 1);
 #undef SHADER
 
@@ -4500,7 +4499,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	uint32_t l_nOutputWidth = g_nOutputWidth;
 	uint32_t l_nOutputHeight = g_nOutputHeight;
 
-	if (g_bEnableDRMRotationShader) {
+	if ( g_uOutputRotation & 1u ) {
 		l_nOutputWidth = g_nOutputHeight;
 		l_nOutputHeight = g_nOutputWidth;
 	}
@@ -4738,28 +4737,7 @@ static void update_tmp_images( uint32_t width, uint32_t height, uint32_t drmForm
 	}
 }
 
-static void update_rotated_images( uint32_t width, uint32_t height )
-{
-	if ( g_output.rotatedOutput != nullptr
-			&& width == g_output.rotatedOutput->width()
-			&& height == g_output.rotatedOutput->height() )
-	{
-		return;
-	}
 
-	CVulkanTexture::createFlags createFlags;
-	createFlags.bSampled = true;
-	createFlags.bStorage = true;
-
-	g_output.rotatedOutput = new CVulkanTexture();
-	bool bSuccess = g_output.rotatedOutput->BInit( width, height, 1u, DRM_FORMAT_ARGB8888, createFlags, nullptr );
-
-	if ( !bSuccess )
-	{
-		vk_log.errorf( "failed to create rotated output" );
-		return;
-	}
-}
 
 static bool init_nis_data()
 {
@@ -5026,10 +5004,13 @@ struct BlitPushData_t
     float u_itmSdrNits; // unset
     float u_itmTargetNits; // unset
 
-	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo)
+	uint32_t u_rotation = 0;
+
+	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo, uint32_t rotation = 0)
 	{
 		u_shaderFilter = 0;
 		u_alphaMode = 0;
+		u_rotation = rotation;
 
 		for (int i = 0; i < frameInfo->layers.count(); i++) {
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers.get( i );
@@ -5183,8 +5164,11 @@ struct RcasPushData_t
     float u_itmSdrNits; // unset
     float u_itmTargetNits; // unset
 
-	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness)
+	uint32_t u_rotation = 0;
+
+	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness, uint32_t rotation = 0)
 	{
+		u_rotation = rotation;
 		uvec4_t tmp;
 		FsrRcasCon(&tmp.x, sharpness);
 		u_layer0Offset.x = uint32_t(int32_t(frameInfo->layers[0].offset.x));
@@ -5439,16 +5423,17 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 	return true;
 }
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool applyRotation, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
 	if ( !pOutputOverride && !vulkan_ensure_output_images() )
 		return std::nullopt;
 
+	const uint32_t uOutputRotation = pOutputOverride ? 0u : g_uOutputRotation;
 	FrameInfo_t sampledFrame = *frameInfo;
 	uint32_t predecodedLutMask = 0;
 	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
 		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
-	if (!frameInfo->useFSRLayer0 && !frameInfo->useSGSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 && !applyRotation && g_reshade_effect.empty())
+	if (!frameInfo->useFSRLayer0 && !frameInfo->useSGSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 && uOutputRotation == 0 && g_reshade_effect.empty())
 	{
 
 
@@ -5565,7 +5550,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	const auto &base = frameInfo->layers.count() > 0 ? frameInfo->layers[0] : emptyBase;
 	const auto *copySource = base.tex && base.tex->linearSource && base.tex->linearSourceDirty ? base.tex->linearSource.get() : base.tex.get();
 	const bool canCopyBase = frameInfo->layers.count() > 0 && copySource && !partial && !pOutputOverride && !pPipewireTexture &&
-		!GetBackend()->UsesVulkanSwapchain() && !applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useSGSRLayer0 && !frameInfo->useNISLayer0 &&
+		!GetBackend()->UsesVulkanSwapchain() && uOutputRotation == 0 && !frameInfo->useFSRLayer0 && !frameInfo->useSGSRLayer0 && !frameInfo->useNISLayer0 &&
 		!frameInfo->blurLayer0 && !frameInfo->frameGenerationActive && !g_bHDRItmEnable && !g_pLastReshadeEffect && g_uCompositeDebug == 0 &&
 		outputTF == EOTF_Gamma22 && (base.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR || base.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB) &&
 		!base.ctm && !frameInfo->shaperLut[EOTF_Gamma22] && base.opacity == 1.0f &&
@@ -5576,7 +5561,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		(!DRMFormatHasAlpha(scanout->drmFormat()) || DRMFormatHasAlpha(copySource->drmFormat()));
 	const bool copyOnly = canCopyBase && frameInfo->layers.count() == 1;
 	const bool raster = frameInfo->layers.count() > 0 && scanout->colorAttachment() && g_device.queueFamily() == g_device.generalQueueFamily() &&
-		!applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useSGSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 &&
+		uOutputRotation == 0 && !frameInfo->useFSRLayer0 && !frameInfo->useSGSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 &&
 		!pPipewireTexture && !g_bHDRItmEnable && g_uCompositeDebug == 0 &&
 		(outputTF == EOTF_Count || (outputTF == EOTF_Gamma22 && ToSrgbVulkanFormat(scanout->format()) != scanout->format())) &&
 		std::all_of(frameInfo->layers.data() + 1, frameInfo->layers.data() + frameInfo->layers.count(),
@@ -5665,15 +5650,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
 
-		if (applyRotation) {
-			// Make a rotatedOutput with normal dimensions
-			update_rotated_images(currentOutputWidth, currentOutputHeight); // 2560x1600
-			cmdBuffer->bindTarget(g_output.rotatedOutput);
-		} else {
-			cmdBuffer->bindTarget(compositeImage);
-		}
+		cmdBuffer->bindTarget(compositeImage);
 
-		cmdBuffer->uploadConstants<RcasPushData_t>(frameInfo, frameInfo->nUpscaleSharpness / 10.0f);
+		cmdBuffer->uploadConstants<RcasPushData_t>(frameInfo, frameInfo->nUpscaleSharpness / 10.0f, uOutputRotation);
 
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
@@ -5713,21 +5692,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		nisFrameInfo.layers.get( 0 ).scale.x = 1.0f;
 		nisFrameInfo.layers.get( 0 ).scale.y = 1.0f;
 
-		const ShaderType nisBlitShader = applyRotation
-			? SHADER_TYPE_BLIT
-			: blit_shader_for_target( compositeImage.get() );
+		const ShaderType nisBlitShader = blit_shader_for_target( compositeImage.get() );
 		cmdBuffer->bindPipeline( g_device.pipeline(nisBlitShader, nisFrameInfo.layers.count(), nisFrameInfo.ycbcrMask(), 0u, nisFrameInfo.colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), &nisFrameInfo);
 
-		if (applyRotation) {
-			// Make a rotatedOutput with normal dimensions
-			update_rotated_images(currentOutputWidth, currentOutputHeight); // 2560x1600
-			cmdBuffer->bindTarget(g_output.rotatedOutput);
-		} else {
-			cmdBuffer->bindTarget(compositeImage);
-		}
+		cmdBuffer->bindTarget(compositeImage);
 
-		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo, uOutputRotation);
 
 		int pixelsPerGroup = 8;
 
@@ -5769,14 +5740,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->bindPipeline(g_device.pipeline(type, frameInfo->layers.count(), frameInfo->ycbcrMask(), blur_layer_count, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 
-		if (applyRotation) {
-			// Make a rotatedOutput with normal dimensions
-			update_rotated_images(currentOutputWidth, currentOutputHeight); // 2560x1600
-			cmdBuffer->bindTarget(g_output.rotatedOutput);
-		} else {
-			cmdBuffer->bindTarget(compositeImage);
-		}
+		cmdBuffer->bindTarget(compositeImage);
 
+		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
 		cmdBuffer->bindTexture(VKR_BLUR_EXTRA_SLOT, g_output.tmpOutput);
 		cmdBuffer->setTextureSrgb(VKR_BLUR_EXTRA_SLOT, !useSrgbView); // Inverted because it chooses whether to view as linear (sRGB view) or sRGB (raw view). It's horrible. I need to change it.
 		cmdBuffer->setSamplerUnnormalized(VKR_BLUR_EXTRA_SLOT, true);
@@ -5786,95 +5752,58 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	else
 	{
-		if (applyRotation) {
-			cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_ROTATION, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
-			bind_all_layers(cmdBuffer.get(), frameInfo);
-			cmdBuffer->bindTarget(compositeImage);
-			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
-
-			const int pixelsPerGroup = 8;
-
-			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
-		} else {
-			CompositeShaderConfig_t compositeConfig;
-			compositeConfig.opaqueOutput = !DRMFormatHasAlpha(compositeImage->drmFormat());
-			compositeConfig.filterMask = compositeConfig.colorMgmtMask = compositeConfig.samplingMask = 0;
-			for (int i = 0; i < frameInfo->layers.count(); ++i)
+		CompositeShaderConfig_t compositeConfig;
+		compositeConfig.opaqueOutput = !DRMFormatHasAlpha(compositeImage->drmFormat());
+		compositeConfig.filterMask = compositeConfig.colorMgmtMask = compositeConfig.samplingMask = 0;
+		for (int i = 0; i < frameInfo->layers.count(); ++i)
+		{
+			const auto &layer = frameInfo->layers[i];
+			compositeConfig.filterMask |= uint32_t(layer.shaderFilter()) << (i * 4);
+			if (layer.ctm)
+				compositeConfig.colorMgmtMask |= 1u << i;
+			const bool aligned = !layer.isYcbcr() && layer.scale.x == 1.0f && layer.scale.y == 1.0f &&
+				float_is_integer(layer.offset.x) && float_is_integer(layer.offset.y);
+			if (aligned)
+				compositeConfig.samplingMask |= 1u << (i + k_nMaxLayers);
+			if (aligned && !layer.ctm && layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR &&
+				frameInfo->shaperLut[EOTF_Gamma22] && ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format())
+				compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 3 * EOTF_Count + i);
+			if (layer.blackBorder)
+				compositeConfig.samplingMask |= 1u << (i + 2 * k_nMaxLayers);
+			if (aligned && layer.offset.x == 0.0f && layer.offset.y == 0.0f &&
+				layer.tex->width() >= currentOutputWidth && layer.tex->height() >= currentOutputHeight)
+				compositeConfig.samplingMask |= 1u << i;
+		}
+		for (uint32_t i = 0; i < EOTF_Count; ++i)
+		{
+			if (frameInfo->shaperLut[i])
 			{
-				const auto &layer = frameInfo->layers[i];
-				compositeConfig.filterMask |= uint32_t(layer.shaderFilter()) << (i * 4);
-				if (layer.ctm)
-					compositeConfig.colorMgmtMask |= 1u << i;
-				const bool aligned = !layer.isYcbcr() && layer.scale.x == 1.0f && layer.scale.y == 1.0f &&
-					float_is_integer(layer.offset.x) && float_is_integer(layer.offset.y);
-				if (aligned)
-					compositeConfig.samplingMask |= 1u << (i + k_nMaxLayers);
-				if (aligned && !layer.ctm && layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR &&
-					frameInfo->shaperLut[EOTF_Gamma22] && ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format())
-					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 3 * EOTF_Count + i);
-				if (layer.blackBorder)
-					compositeConfig.samplingMask |= 1u << (i + 2 * k_nMaxLayers);
-				if (aligned && layer.offset.x == 0.0f && layer.offset.y == 0.0f &&
-					layer.tex->width() >= currentOutputWidth && layer.tex->height() >= currentOutputHeight)
-					compositeConfig.samplingMask |= 1u << i;
-			}
-			for (uint32_t i = 0; i < EOTF_Count; ++i)
-			{
-				if (frameInfo->shaperLut[i])
-				{
-					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + i);
-					if (frameInfo->shaperLut[i]->identityLut || (predecodedLutMask & (1u << i)))
-						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + EOTF_Count + i);
-					if (predecodedLutMask & (1u << i))
-						compositeConfig.colorMgmtMask |= 1u << (2 * k_nMaxLayers + 3 * EOTF_Count + i);
-					if (frameInfo->shaperLut[i]->blackPreservingLut && frameInfo->lut3D[i] && frameInfo->lut3D[i]->blackPreservingLut)
-						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
-				}
-				else
+				compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + i);
+				if (frameInfo->shaperLut[i]->identityLut || (predecodedLutMask & (1u << i)))
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + EOTF_Count + i);
+				if (predecodedLutMask & (1u << i))
+					compositeConfig.colorMgmtMask |= 1u << (2 * k_nMaxLayers + 3 * EOTF_Count + i);
+				if (frameInfo->shaperLut[i]->blackPreservingLut && frameInfo->lut3D[i] && frameInfo->lut3D[i]->blackPreservingLut)
 					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
 			}
-			const bool simpleBlend = frameInfo->layers.count() > 0 && frameInfo->layers[0].opacity == 1.0f &&
-				std::all_of(frameInfo->layers.data() + 1, frameInfo->layers.data() + frameInfo->layers.count(),
-					[](const auto &layer) { return layer.opacity == 1.0f && layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
-
-			bind_all_layers(cmdBuffer.get(), frameInfo, compositeConfig.colorMgmtMask >> (k_nMaxLayers + 3 * EOTF_Count));
-			cmdBuffer->bindTarget(compositeImage);
-			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
-
-			if (raster)
-				cmdBuffer->drawComposite(frameInfo, outputTF, compositeConfig, canCopyBase);
 			else
-			{
+				compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
+		}
+		const bool simpleBlend = frameInfo->layers.count() > 0 && frameInfo->layers[0].opacity == 1.0f &&
+			std::all_of(frameInfo->layers.data() + 1, frameInfo->layers.data() + frameInfo->layers.count(),
+				[](const auto &layer) { return layer.opacity == 1.0f && layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
+
+		bind_all_layers(cmdBuffer.get(), frameInfo, compositeConfig.colorMgmtMask >> (k_nMaxLayers + 3 * EOTF_Count));
+		cmdBuffer->bindTarget(compositeImage);
+		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
+
+		if (raster)
+			cmdBuffer->drawComposite(frameInfo, outputTF, compositeConfig, canCopyBase);
+		else
+		{
 			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layers.count(),
 				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, simpleBlend, compositeConfig));
-				cmdBuffer->dispatch(div_roundup(currentOutputWidth, 8), div_roundup(currentOutputHeight, 8));
-			}
-		}
-	}
-
-	if (applyRotation)
-	{
-		if (g_output.rotatedOutput != nullptr) {
-			// Rotate the final output
-			// TODO: may need rework with another rotation shader for blur, fsr and nis
-			cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_ROTATION, frameInfo->layers.count(), frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF));
-			bind_all_layers(cmdBuffer.get(), frameInfo);
-
-			// if (frameInfo->blurLayer0) {
-			// 	bool useSrgbView = frameInfo->layers[0].colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
-			//
-			// 	cmdBuffer->bindTexture(VKR_BLUR_EXTRA_SLOT, g_output.rotatedOutput);
-			// 	cmdBuffer->setTextureSrgb(VKR_BLUR_EXTRA_SLOT, !useSrgbView);
-			// 	cmdBuffer->setSamplerUnnormalized(VKR_BLUR_EXTRA_SLOT, true);
-			// 	cmdBuffer->setSamplerNearest(VKR_BLUR_EXTRA_SLOT, false);
-			// }
-
-			cmdBuffer->bindTarget(compositeImage);
-			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
-
-			const int pixelsPerGroup = 8;
-
-			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
+			cmdBuffer->dispatch(div_roundup(currentOutputWidth, 8), div_roundup(currentOutputHeight, 8));
 		}
 	}
 
@@ -6410,7 +6339,7 @@ namespace
 				else
 				{
 					sequence = vulkan_composite( &generatedFrame, nullptr, false, scanout,
-						false, std::move( cmdBuffer ), false, fsrIntermediate );
+						false, std::move( cmdBuffer ), fsrIntermediate );
 				}
 				if ( !sequence )
 				{
@@ -6507,7 +6436,7 @@ namespace
 
 					std::optional<uint64_t> realSequence = vulkan_composite(
 						&realFrame, nullptr, false, realScanout, false,
-						std::move( realCmdBuffer ), false, fsrIntermediate );
+						std::move( realCmdBuffer ), fsrIntermediate );
 					if ( !realSequence )
 					{
 						gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );

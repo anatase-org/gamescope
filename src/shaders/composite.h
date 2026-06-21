@@ -1,3 +1,20 @@
+// Rotate only the final store coordinate (CCW 90-degree steps: 1=90, 2=180,
+// 3=270); the scene stays logical so sampling and blending are unchanged.
+uvec2 outputLogicalSize(uint rotation) {
+    uvec2 size = imageSize(dst);
+    return (rotation & 1u) != 0u ? uvec2(size.y, size.x) : size;
+}
+
+ivec2 rotateOutputCoord(uvec2 coord, uint rotation) {
+    uvec2 size = imageSize(dst);
+    switch (rotation) {
+        case 1u: return ivec2(coord.y, size.y - 1u - coord.x);
+        case 2u: return ivec2(size.x - 1u - coord.x, size.y - 1u - coord.y);
+        case 3u: return ivec2(size.x - 1u - coord.y, coord.x);
+        default: return ivec2(coord);
+    }
+}
+
 #ifdef VKR_FRAGMENT
 layout(constant_id = 16) const bool c_linear_source = false;
 layout(binding = 7, std430) readonly buffer LinearPixels { uint u_linearPixels[]; };
@@ -68,7 +85,7 @@ uint pseudo_random(uint seed) {
     return seed * 1664525u + 1013904223u;
 }
 
-void compositing_debug(uvec2 coord) {
+void compositing_debug(uvec2 coord, uint rotation) {
     uvec2 pos = coord;
     pos.x -= (u_frameId & 2) != 0 ?  128 : 0;
     pos.y -= (u_frameId & 1) != 0 ?  128 : 0;
@@ -84,7 +101,7 @@ void compositing_debug(uvec2 coord) {
             if (time.x + time.y + time.z + time.w < 2.0f)
                 value = vec4(0.0f, 0.0f, 0.0f, 1.0f);
         }
-        imageStore(dst, ivec2(coord), value);
+        imageStore(dst, rotateOutputCoord(coord, rotation), value);
     }
 }
 

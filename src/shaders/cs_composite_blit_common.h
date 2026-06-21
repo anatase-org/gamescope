@@ -45,7 +45,7 @@ vec4 blendLayer(uint layerIdx, vec2 uv, vec4 background) {
 
 void main() {
     uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
-    uvec2 outSize = imageSize(dst);
+    uvec2 outSize = outputLogicalSize(u_rotation);
 
     if (coord.x >= outSize.x || coord.y >= outSize.y)
         return;
@@ -73,9 +73,9 @@ void main() {
     // XRGB targets discard alpha, so intermediate alpha calculations are dead.
     if (c_opaque_output)
         outputValue.a = 1.0;
-    imageStore(dst, ivec2(coord), outputValue);
+    imageStore(dst, rotateOutputCoord(coord, u_rotation), outputValue);
 
     // Indicator to quickly tell if we're in the compositing path or not.
     if (checkDebugFlag(compositedebug_Markers))
-        compositing_debug(coord);
+        compositing_debug(coord, u_rotation);
 }
