@@ -11,6 +11,7 @@
 #include <bitset>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 #include "main.hpp"
 
@@ -1030,7 +1031,7 @@ protected:
 	bool createShaders();
 	bool createScratchResources();
 	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend = false, CompositeShaderConfig_t composite_config = {});
-	void compileAllPipelines();
+	void compileAllPipelines(std::stop_token st);
 
 	VkDevice m_device = nullptr;
 	VkPhysicalDevice m_physDev = nullptr;
@@ -1091,6 +1092,7 @@ protected:
 
 private:
 	std::vector<VkExtensionProperties> m_supportedExts;
+	std::jthread m_pipelineThread;
 };
 
 struct TextureState

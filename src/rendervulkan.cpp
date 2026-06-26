@@ -447,8 +447,7 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 
 	if ( !isV3dv() )
 	{
-		std::thread piplelineThread([this](){compileAllPipelines();});
-		piplelineThread.detach();
+		m_pipelineThread = std::jthread([this](std::stop_token st){compileAllPipelines(st);});
 	}
 
 	g_reshadeManager.init(this);
@@ -1473,7 +1472,7 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 	return result;
 }
 
-void CVulkanDevice::compileAllPipelines()
+void CVulkanDevice::compileAllPipelines(std::stop_token st)
 {
 	pthread_setname_np( pthread_self(), "gamescope-shdr" );
 
@@ -1508,6 +1507,11 @@ void CVulkanDevice::compileAllPipelines()
 					{
 						std::lock_guard<std::mutex> lock(m_pipelineMutex);
 						PipelineInfo_t key = {info.shaderType, layerCount, ycbcrMask, blur_layers, info.compositeDebug};
+						if (st.stop_requested())
+						{
+							vk.DestroyPipeline(device(), newPipeline, nullptr);
+							return;
+						}
 						auto result = m_pipelineMap.emplace(std::make_pair(key, newPipeline));
 						if (!result.second)
 							vk.DestroyPipeline(device(), newPipeline, nullptr);
