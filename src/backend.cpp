@@ -79,34 +79,38 @@ namespace gamescope
 
     uint32_t CBaseBackendFb::IncRef()
     {
-        uint32_t uRefCount = IBackendFb::IncRef();
-        if ( m_pClientBuffer && !uRefCount )
+        uint32_t uRefCount = m_uRefCount++;
+        if ( !uRefCount )
         {
-            wlserver_lock();
-            wlr_buffer_lock( m_pClientBuffer );
-            wlserver_unlock( false );
+            IncRefPrivate();
+
+            if ( m_pClientBuffer )
+            {
+                wlserver_lock();
+                wlr_buffer_lock( m_pClientBuffer );
+                wlserver_unlock( false );
+            }
         }
+
         return uRefCount;
     }
     uint32_t CBaseBackendFb::DecRef()
     {
-        wlr_buffer *pClientBuffer = m_pClientBuffer;
-
-        std::shared_ptr<CReleaseTimelinePoint> pReleasePoint = std::move( m_pReleasePoint );
-        m_pReleasePoint = nullptr;
-
-        uint32_t uRefCount = IBackendFb::DecRef();
-        if ( uRefCount )
+        uint32_t uRefCount = --m_uRefCount;
+        if ( !uRefCount )
         {
-            if ( pReleasePoint )
-                m_pReleasePoint = std::move( pReleasePoint );
+            m_pReleasePoint = nullptr;
+            if ( m_pClientBuffer )
+            {
+                wlserver_lock();
+                wlr_buffer_unlock( m_pClientBuffer );
+                wlserver_unlock();
+            }
+
+            // Potentially release now!
+            DecRefPrivate();
         }
-        else if ( pClientBuffer )
-        {
-            wlserver_lock();
-            wlr_buffer_unlock( pClientBuffer );
-            wlserver_unlock();
-        }
+
         return uRefCount;
     }
 
@@ -129,6 +133,9 @@ namespace gamescope
 
     void CBaseBackendFb::SetReleasePoint( std::shared_ptr<CReleaseTimelinePoint> pReleasePoint )
     {
+        if ( m_pReleasePoint == pReleasePoint )
+            return;
+
         m_pReleasePoint = pReleasePoint;
 
         if ( m_pClientBuffer && GetRefCount() )
