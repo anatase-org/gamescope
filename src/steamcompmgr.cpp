@@ -1528,6 +1528,12 @@ import_commit (
 	}
 
 	gamescope::OwningRc<CVulkanTexture> pOwnedTexture = vulkan_create_texture_from_wlr_buffer( buf, std::move( pBackendFb ) );
+
+	if ( pOwnedTexture == nullptr ) {
+		// Failed to create Vulkan texture from Wayland buffer for some reason.
+		return nullptr;
+	}
+
 	commit->vulkanTex = pOwnedTexture;
 
 	if ( bDmabuf )
@@ -7534,14 +7540,14 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		reslistentry.desired_present_time,
 		reslistentry.fifo );
 
-	newCommit->damage = std::move(reslistentry.damage);
-	newCommit->damage.texture = newCommit->vulkanTex->textureID;
-	if (newCommit->vulkanTex->linearSource)
-		newCommit->vulkanTex->linearSourceDamage = newCommit->damage;
-
 	int fence = -1;
 	if ( newCommit != nullptr )
 	{
+		newCommit->damage = std::move(reslistentry.damage);
+		newCommit->damage.texture = newCommit->vulkanTex->textureID;
+		if (newCommit->vulkanTex->linearSource)
+			newCommit->vulkanTex->linearSourceDamage = newCommit->damage;
+
 		// KMS framebuffers already retain explicit release points for their scanout
 		// lifetime. Vulkan-only imports need the same ownership: keep the point on
 		// the commit and let the consuming AMD command buffer retain it to GPU
