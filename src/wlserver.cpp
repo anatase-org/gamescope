@@ -1644,6 +1644,9 @@ static void handle_session_active( struct wl_listener *listener, void *data )
 {
 	if ( wlserver.wlr.session->active )
 		blank_unused_kms_devices();
+	// Releases delivered while another VT owns input never reach us.
+	if ( !wlserver.wlr.session->active )
+		wlserver.mapPressedHotkeyKeys.clear();
 
 	GetBackend()->DirtyState( wlserver.wlr.session->active, wlserver.wlr.session->active );
 	wl_log.infof( "Session %s", wlserver.wlr.session->active ? "resumed" : "paused" );
