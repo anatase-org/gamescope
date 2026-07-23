@@ -343,7 +343,6 @@ struct FrameInfo_t
 
 	bool dpms;
 
-	int layerCount;
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
@@ -416,22 +415,69 @@ struct FrameInfo_t
 			float y = offset.y + 0.5f / scale.y;
 			return { x, y };
 		}
-	} layers[ k_nMaxLayers ];
+	};
+
+	class LayerStack_t
+	{
+	public:
+		Layer_t *push()
+		{
+			if ( m_nCount >= k_nMaxLayers )
+				return nullptr;
+
+			return &m_Layers[ m_nCount++ ];
+		}
+
+		void pop()
+		{
+			assert( m_nCount > 0 );
+			m_nCount--;
+		}
+
+		void truncate( int nCount )
+		{
+			assert( nCount >= 0 && nCount <= m_nCount );
+			m_nCount = nCount;
+		}
+
+		int count() const { return m_nCount; }
+
+		Layer_t *data() { return m_Layers; }
+		const Layer_t *data() const { return m_Layers; }
+		Layer_t &operator[]( int index ) { return get( index ); }
+		const Layer_t &operator[]( int index ) const { return get( index ); }
+
+		Layer_t &get( int nIndex )
+		{
+			assert( nIndex >= 0 && nIndex < m_nCount );
+			return m_Layers[ nIndex ];
+		}
+
+		const Layer_t &get( int nIndex ) const
+		{
+			assert( nIndex >= 0 && nIndex < m_nCount );
+			return m_Layers[ nIndex ];
+		}
+
+	private:
+		Layer_t m_Layers[ k_nMaxLayers ];
+		int m_nCount = 0;
+	} layers;
 
 	uint32_t borderMask() const {
 		uint32_t result = 0;
-		for (int i = 0; i < layerCount; i++)
+		for (int i = 0; i < layers.count(); i++)
 		{
-			if (layers[ i ].blackBorder)
+			if (layers.get( i ).blackBorder)
 				result |= 1 << i;
 		}
 		return result;
 	}
 	uint32_t ycbcrMask() const {
 		uint32_t result = 0;
-		for (int i = 0; i < layerCount; i++)
+		for (int i = 0; i < layers.count(); i++)
 		{
-			if (layers[ i ].isYcbcr())
+			if (layers.get( i ).isYcbcr())
 				result |= 1 << i;
 		}
 		return result;
@@ -440,7 +486,7 @@ struct FrameInfo_t
 		static_assert( VKR_COLORSPACE_DISPLAY_NATIVE >= GamescopeAppTextureColorspace_Count );
 		static_assert( VKR_COLORSPACE_DISPLAY_NATIVE < ( 1u << GamescopeAppTextureColorspace_Bits ) );
 		uint32_t result = 0;
-		for (int i = 0; i < layerCount; i++)
+		for (int i = 0; i < layers.count(); i++)
 		{
 			const uint32_t colorspace = layers[i].outputColorMgmtApplied &&
 				outputEncodingEOTF == EOTF_Gamma22 &&

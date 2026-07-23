@@ -1539,7 +1539,7 @@ namespace gamescope
         bool bNeedsFullComposite = false;
 
         // TODO: Dedupe some of this composite check code between us and drm.cpp
-        bool bLayer0ScreenSize = close_enough(pFrameInfo->layers[0].scale.x, 1.0f) && close_enough(pFrameInfo->layers[0].scale.y, 1.0f);
+        bool bLayer0ScreenSize = close_enough(pFrameInfo->layers.get( 0 ).scale.x, 1.0f) && close_enough(pFrameInfo->layers.get( 0 ).scale.y, 1.0f);
 
         bool bNeedsCompositeFromFilter = (g_upscaleFilter == GamescopeUpscaleFilter::NEAREST || g_upscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
 
@@ -1557,7 +1557,7 @@ namespace gamescope
             bNeedsFullComposite |= g_bHDRItmEnable;
 
         if ( !m_pBackend->SupportsColorManagement() )
-            bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers[0].colorspace );
+            bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers.get( 0 ).colorspace );
 
         bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
 
@@ -1569,9 +1569,9 @@ namespace gamescope
         if ( !bNeedsFullComposite )
         {
             bool bNeedsBacking = true;
-            if ( pFrameInfo->layerCount >= 1 )
+            if ( pFrameInfo->layers.count() >= 1 )
             {
-                if ( pFrameInfo->layers[0].isScreenSize() && ( !pFrameInfo->layers[0].hasAlpha() || cv_vr_transparent_backing ) )
+                if ( pFrameInfo->layers.get( 0 ).isScreenSize() && ( !pFrameInfo->layers.get( 0 ).hasAlpha() || cv_vr_transparent_backing ) )
                     bNeedsBacking = false;
             }
 
@@ -1594,7 +1594,7 @@ namespace gamescope
             }
 
             for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
-                m_Planes[uCurrentPlane++].Present( i < pFrameInfo->layerCount ? &pFrameInfo->layers[i] : nullptr );
+                m_Planes[uCurrentPlane++].Present( i < pFrameInfo->layers.count() ? &pFrameInfo->layers[i] : nullptr );
         }
         else
         {
