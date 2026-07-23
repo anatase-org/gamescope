@@ -26,14 +26,16 @@ extern LogScope xwm_log;
 
 struct focus_t
 {
-	steamcompmgr_win_t				*focusWindow;
-	steamcompmgr_win_t				*inputFocusWindow;
-	uint32_t		inputFocusMode;
-	steamcompmgr_win_t				*overlayWindow;
-	steamcompmgr_win_t				*externalOverlayWindow;
-	steamcompmgr_win_t				*notificationWindow;
-	steamcompmgr_win_t				*overrideWindow;
-	bool			outdatedInteractiveFocus;
+	steamcompmgr_win_t				*focusWindow = nullptr;
+	steamcompmgr_win_t				*inputFocusWindow = nullptr;
+	uint32_t		inputFocusMode = 0;
+	steamcompmgr_win_t				*overlayWindow = nullptr;
+	steamcompmgr_win_t				*externalOverlayWindow = nullptr;
+	steamcompmgr_win_t				*notificationWindow = nullptr;
+	steamcompmgr_win_t				*overrideWindow = nullptr;
+	// Same-app helpers from other processes (eg. Xalia's highlight), painted above the override.
+	std::vector<steamcompmgr_win_t*>	decorationWindows;
+	bool			outdatedInteractiveFocus = false;
 	bool			bResetToCorner = false;
 	bool			bResetToCenter = false;
 
