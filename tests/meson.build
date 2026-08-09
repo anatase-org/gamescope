@@ -56,7 +56,7 @@ if catch2_dep.found()
 		include_directories: [srcdir], dependencies: [catch2_dep], cpp_args: gamescope_cpp_args)
 	test('upscale', test_upscale)
 
-	foreach name : ['mangoapp_config', 'mangoapp_control']
+	foreach name : ['mangoapp_config', 'mangoapp_control', 'mode_list']
 		t = executable('test_' + name, 'test_' + name + '.cpp',
 			include_directories: [srcdir], dependencies: [catch2_dep], cpp_args: gamescope_cpp_args)
 		test(name, t)
