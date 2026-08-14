@@ -151,7 +151,6 @@ struct steamcompmgr_win_t {
 	bool bHasHadNonSRGBColorSpace = false;
 	bool bHasHDRColorspace = false;
 
-	bool nudged = false;
 	bool placed = false;
 	bool ignoreOverrideRedirect = false;
 

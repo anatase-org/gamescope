@@ -4139,12 +4139,6 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 		}
 	}
 
-	if (!ctx->focus.focusWindow->nudged)
-	{
-		XMoveWindow(ctx->dpy, ctx->focus.focusWindow->xwayland().id, 1, 1);
-		ctx->focus.focusWindow->nudged = true;
-	}
-
 	// X confines the pointer to the screen, so a screen-sized focus window only
 	// sees all of it at the origin. Place it there once, a client that moves it
 	// afterwards keeps its position. Oversized windows stay put, clients centre
@@ -5333,7 +5327,6 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
 	new_win->skipPager = false;
 	new_win->requestedWidth = 0;
 	new_win->requestedHeight = 0;
-	new_win->nudged = false;
 	new_win->placed = false;
 	new_win->ignoreOverrideRedirect = false;
 
