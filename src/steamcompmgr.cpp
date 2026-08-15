@@ -939,6 +939,12 @@ struct global_focus_t : public focus_t
 	std::array< BaseLayerInfo_t, HELD_COMMIT_COUNT > CachedPlanes = {};
 	unsigned int uFadeOutStartTime = 0;
 	bool bPendingFade = false;
+	bool bFSRActive = false;
+	uint64_t ulBasePlaneCommitID = 0;
+	uint32_t uBasePlaneAppID = 0;
+	bool bBasePlaneIsFifo = false;
+	pid_t nFocusWindowPid = 0;
+	std::shared_ptr<std::string> pFocusWindowEngine;
 
 	gamescope::VirtualConnectorKey_t ulVirtualFocusKey = 0;
 	std::shared_ptr<gamescope::IBackendConnector> pVirtualConnector;
@@ -2415,9 +2421,9 @@ paint_window(global_focus_t *pFocus, steamcompmgr_win_t *w, steamcompmgr_win_t *
 		if ( !(flags & PaintWindowFlag::FadeTarget) )
 			pFocus->CachedPlanes[ HELD_COMMIT_FADE ] = basePlane;
 
-		g_uCurrentBasePlaneCommitID = lastCommit->commitID;
-		g_uCurrentBasePlaneAppID = lastCommit->appID;
-		g_bCurrentBasePlaneIsFifo = lastCommit->IsPerfOverlayFIFO();
+		pFocus->ulBasePlaneCommitID = lastCommit->commitID;
+		pFocus->uBasePlaneAppID = lastCommit->appID;
+		pFocus->bBasePlaneIsFifo = lastCommit->IsPerfOverlayFIFO();
 	}
 }
 
@@ -3043,9 +3049,9 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 	// Capture FSR activity before frame generation replaces the raw base layer
 	// with its queued midpoint/real scanout buffers. Those buffers have already
 	// had FSR applied and therefore no longer carry useFSRLayer0 themselves.
-	g_bFSRActive = frameInfo.useFSRLayer0;
+	pFocus->bFSRActive = frameInfo.useFSRLayer0;
 	if ( const auto& heldCommit = pFocus->HeldCommits[HELD_COMMIT_BASE]; heldCommit && heldCommit->upscaledTexture ) {
-		g_bFSRActive = ( heldCommit->upscaledTexture->eFilter == GamescopeUpscaleFilter::FSR );
+		pFocus->bFSRActive = ( heldCommit->upscaledTexture->eFilter == GamescopeUpscaleFilter::FSR );
 	}
 
 	// Screenshots of the composition should use the real application layer, not
@@ -3061,12 +3067,12 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 		steamcompmgr_window_allows_frame_generation( w ) &&
 		!fadingOut && frameInfo.layers.count() > 0 &&
 		pFocus->HeldCommits[HELD_COMMIT_BASE] &&
-		pFocus->HeldCommits[HELD_COMMIT_BASE]->commitID == g_uCurrentBasePlaneCommitID;
+		pFocus->HeldCommits[HELD_COMMIT_BASE]->commitID == pFocus->ulBasePlaneCommitID;
 	if ( frameGenerationEligible )
 	{
 		vulkan_frame_generation_apply( &frameInfo,
 			pFocus->HeldCommits[HELD_COMMIT_BASE]->vulkanTex,
-			g_uCurrentBasePlaneCommitID, g_uCurrentBasePlaneAppID,
+			pFocus->ulBasePlaneCommitID, pFocus->uBasePlaneAppID,
 			frameGenerationPrepareOnly );
 	}
 	else if ( frameGeneration.enabled )
@@ -7301,8 +7307,8 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 						pFocus->HeldCommits[ HELD_COMMIT_BASE ] = w->commit_queue[ j ];
 					hasRepaint = true;
 
-					focusWindow_engine = w->engineName;
-					focusWindow_pid = w->pid;
+					pFocus->pFocusWindowEngine = w->engineName;
+					pFocus->nFocusWindowPid = w->pid;
 				}
 
 				if ( w == pFocus->overrideWindow || w == pFocus->overrideUnderlayWindow ||
@@ -8804,6 +8810,22 @@ static void schedule_frame_generation_output_timer( uint64_t now, uint64_t inter
 	g_FrameGenerationOutputTimer.ArmTimer( s_uFrameGenerationOutputDeadline );
 }
 
+// mangoapp_update also runs on the image waiter thread, so publish plain
+// globals here rather than have it walk the focus.
+static void publish_mangoapp_snapshot()
+{
+	global_focus_t *pFocus = GetCurrentFocus();
+	if ( !pFocus )
+		return;
+
+	g_bFSRActive = pFocus->bFSRActive;
+	focusWindow_pid = pFocus->nFocusWindowPid;
+	focusWindow_engine = pFocus->pFocusWindowEngine;
+	g_uCurrentBasePlaneCommitID = pFocus->ulBasePlaneCommitID;
+	g_uCurrentBasePlaneAppID = pFocus->uBasePlaneAppID;
+	g_bCurrentBasePlaneIsFifo = pFocus->bBasePlaneIsFifo;
+}
+
 void
 steamcompmgr_main(int argc, char **argv)
 {
@@ -9860,6 +9882,8 @@ steamcompmgr_main(int argc, char **argv)
 				script.Manager().CallHook( "OnPostPaint" );
 			}
 		}
+
+		publish_mangoapp_snapshot();
 
 		if ( bIsVBlankFromTimer )
 		{
