@@ -926,6 +926,14 @@ struct BaseLayerInfo_t
 	AlphaBlendingMode_t eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
 };
 
+struct TempUpscaleImage_t
+{
+	gamescope::OwningRc<CVulkanTexture> pTexture;
+	// Timeline of upscale -> release, to be used as acquire for the commit.
+	std::shared_ptr<gamescope::CTimeline> pReleaseTimeline;
+	uint64_t ulLastPoint = 0ul;
+};
+
 struct global_focus_t : public focus_t
 {
 	steamcompmgr_win_t	  	 		*keyboardFocusWindow;
@@ -934,6 +942,9 @@ struct global_focus_t : public focus_t
 
 	GamescopeUpscaleFilter eUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+	// Cleanup for the previous pre-emptive upscale, kept a frame behind.
+	std::optional<uint64_t> oLastPreemptiveUpscaleSeqNo;
+	std::vector<TempUpscaleImage_t> UpscaleImages;
 
 	std::array< gamescope::Rc<commit_t>, HELD_COMMIT_COUNT > HeldCommits;
 	std::array< BaseLayerInfo_t, HELD_COMMIT_COUNT > CachedPlanes = {};
@@ -978,6 +989,22 @@ global_focus_t *GetCurrentFocus()
 
 	if ( g_VirtualConnectorFocuses.size() > 0 )
 		return &g_VirtualConnectorFocuses.begin()->second;
+
+	return nullptr;
+}
+
+// The focus whose focusWindow is w, ignoring the other window roles.
+// Guards w because a null one would match any focus without a window.
+global_focus_t *GetFocusForWindow( steamcompmgr_win_t *w )
+{
+	if ( !w )
+		return nullptr;
+
+	for ( auto &iter : g_VirtualConnectorFocuses )
+	{
+		if ( iter.second.focusWindow == w )
+			return &iter.second;
+	}
 
 	return nullptr;
 }
@@ -7600,41 +7627,32 @@ void force_repaint( void )
 	nudge_steamcompmgr();
 }
 
-struct TempUpscaleImage_t
+static void ClearUpscaleImages( global_focus_t *pFocus )
 {
-	gamescope::OwningRc<CVulkanTexture> pTexture;
-	// Timeline of upscale -> release, to be used as acquire for the commit.
-	std::shared_ptr<gamescope::CTimeline> pReleaseTimeline;
-	uint64_t ulLastPoint = 0ul;
-};
-
-static std::vector<TempUpscaleImage_t> g_pUpscaleImages;
-void ClearUpscaleImages()
-{
-	g_pUpscaleImages.clear();
+	pFocus->UpscaleImages.clear();
 }
 
-static TempUpscaleImage_t *GetTempUpscaleImage( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat )
+static TempUpscaleImage_t *GetTempUpscaleImage( global_focus_t *pFocus, uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat )
 {
-	if ( g_pUpscaleImages.size() )
+	if ( pFocus->UpscaleImages.size() )
 	{
 		// Mixing and matching sizes to only do the min required would be nice
 		// but massively complicates caching.
-		if ( g_pUpscaleImages[0].pTexture->width() != uWidth ||
-			 g_pUpscaleImages[0].pTexture->height() != uHeight ||
-			 g_pUpscaleImages[0].pTexture->drmFormat() != uDrmFormat )
+		if ( pFocus->UpscaleImages[0].pTexture->width() != uWidth ||
+			 pFocus->UpscaleImages[0].pTexture->height() != uHeight ||
+			 pFocus->UpscaleImages[0].pTexture->drmFormat() != uDrmFormat )
 		{
-			g_pUpscaleImages.clear();
+			pFocus->UpscaleImages.clear();
 		}
 	}
 
-	for ( TempUpscaleImage_t &image : g_pUpscaleImages )
+	for ( TempUpscaleImage_t &image : pFocus->UpscaleImages )
 	{
 		if ( !image.pTexture->IsInUse() )
 			return &image;
 	}
 
-	if ( g_pUpscaleImages.size() > 8 )
+	if ( pFocus->UpscaleImages.size() > 8 )
 	{
 		xwm_log.warnf( "No upscale images free!\n" );
 		return {};
@@ -7651,7 +7669,7 @@ static TempUpscaleImage_t *GetTempUpscaleImage( uint32_t uWidth, uint32_t uHeigh
 	imageFlags.bStorage = true;
 	imageFlags.bFlippable = true;
 	pTexture->BInit( g_nOutputWidth, g_nOutputHeight, 1, uDrmFormat, imageFlags );
-	TempUpscaleImage_t &image = g_pUpscaleImages.emplace_back( std::move( pTexture ), std::move( pTimeline ) );
+	TempUpscaleImage_t &image = pFocus->UpscaleImages.emplace_back( std::move( pTexture ), std::move( pTimeline ) );
 
 	return &image;
 }
@@ -7775,10 +7793,10 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		// work. Preemptive scaling reverses that GPU order and consumes most of
 		// the midpoint's output slot, so let the queued real slot run its single
 		// FSR chain after generated-frame synthesis instead.
-		bool bValidPreemptiveScale = reslistentry.pAcquirePoint && pCurrentFocus &&
-			w == pCurrentFocus->focusWindow && cv_upscale_preemptive &&
+		global_focus_t *pUpscaleFocus = GetFocusForWindow( w );
+		bool bValidPreemptiveScale = reslistentry.pAcquirePoint && pUpscaleFocus && cv_upscale_preemptive &&
 			!steamcompmgr_frame_generation_enabled_for_focus();
-		bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale( pCurrentFocus->eUpscaleFilter, pCurrentFocus->eUpscaleScaler );
+		bool bPreemptiveUpscale = bValidPreemptiveScale && newCommit->ShouldPreemptivelyUpscale( pUpscaleFocus->eUpscaleFilter, pUpscaleFocus->eUpscaleScaler );
 
 		bool bKnownReady = false;
 
@@ -7798,8 +7816,8 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 			overscanScaleRatio = 1.0f;
 			zoomScaleRatio = 1.0f;
 			globalScaleRatio = 1.0f;
-			upscaledFrameInfo.eUpscaleFilter = pCurrentFocus->eUpscaleFilter;
-			upscaledFrameInfo.eUpscaleScaler = pCurrentFocus->eUpscaleScaler;
+			upscaledFrameInfo.eUpscaleFilter = pUpscaleFocus->eUpscaleFilter;
+			upscaledFrameInfo.eUpscaleScaler = pUpscaleFocus->eUpscaleScaler;
 			paint_window_commit( newCommit, w, w, &upscaledFrameInfo, nullptr );
 			upscaledFrameInfo.useFSRLayer0 = upscaledFrameInfo.eUpscaleFilter == GamescopeUpscaleFilter::FSR;
 			upscaledFrameInfo.useNISLayer0 = upscaledFrameInfo.eUpscaleFilter == GamescopeUpscaleFilter::NIS;
@@ -7807,7 +7825,7 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 			zoomScaleRatio = flOldZoomScale;
 			overscanScaleRatio = flOldOverscanScale;
 
-			TempUpscaleImage_t *pTempImage = GetTempUpscaleImage( g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat );
+			TempUpscaleImage_t *pTempImage = GetTempUpscaleImage( pUpscaleFocus, g_nOutputWidth, g_nOutputHeight, g_output.uOutputFormat );
 			if ( pTempImage )
 			{
 				const uint64_t ulNextReleasePoint = pTempImage->ulLastPoint + 1;
@@ -7822,11 +7840,10 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 				{
 					pTempImage->ulLastPoint = ulNextReleasePoint;
 
-					static std::optional<uint64_t> s_ulLastPreemptiveUpscaleSeqNo;
 
-					if ( s_ulLastPreemptiveUpscaleSeqNo )
+					if ( pUpscaleFocus->oLastPreemptiveUpscaleSeqNo )
 					{
-						vulkan_wait( *s_ulLastPreemptiveUpscaleSeqNo, true );
+						vulkan_wait( *pUpscaleFocus->oLastPreemptiveUpscaleSeqNo, true );
 					}
 
 					std::optional<uint64_t> seqNo = vulkan_composite( &upscaledFrameInfo, nullptr, false, pTempImage->pTexture, false, std::move( pCommandBuffer ) );
@@ -7836,7 +7853,7 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 						vulkan_wait( *seqNo, true );
 					}
 
-					s_ulLastPreemptiveUpscaleSeqNo = seqNo;
+					pUpscaleFocus->oLastPreemptiveUpscaleSeqNo = seqNo;
 
 					newCommit->upscaledTexture = std::optional<UpscaledTexture_t>
 					{
@@ -7865,7 +7882,7 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		{
 			if ( bValidPreemptiveScale )
 			{
-				ClearUpscaleImages();
+				ClearUpscaleImages( pUpscaleFocus );
 			}
 
 			if ( reslistentry.pAcquirePoint )
