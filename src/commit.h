@@ -37,7 +37,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 	bool CloseFenceInternal();
 	void SetFence( int nFence, bool bMangoNudge, const std::shared_ptr<CommitDoneList_t> &pDoneCommits );
 
-	bool ShouldPreemptivelyUpscale();
+	bool ShouldPreemptivelyUpscale( GamescopeUpscaleFilter eFilter, GamescopeUpscaleScaler eScaler );
 	void SetReleasePoint( std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint );
 
 	struct wlr_buffer *buf = nullptr;

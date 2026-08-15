@@ -52,6 +52,10 @@ if catch2_dep.found()
 		cpp_args: gamescope_cpp_args,
 	)
 	test('utils/process', test_process, depends: [reaper_test_helper])
+	test_upscale = executable('test_upscale', 'test_upscale.cpp',
+		include_directories: [srcdir], dependencies: [catch2_dep], cpp_args: gamescope_cpp_args)
+	test('upscale', test_upscale)
+
 endif
 
 # Keep the color regression available when Catch2 is not installed.
