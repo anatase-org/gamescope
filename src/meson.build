@@ -27,8 +27,8 @@ udev_dep = dependency('libudev')
 systemd_dep = dependency('libsystemd', required: false)
 
 wlroots_dep = dependency(
-  'wlroots-0.19',
-  version: ['>= 0.19.0', '< 0.20.0'],
+  'wlroots-0.20',
+  version: ['>= 0.20.0', '< 0.21.0'],
   fallback: 'wlroots',
   default_options: ['default_library=static', 'examples=false', 'xwayland=enabled', 'backends=libinput', 'renderers=[]', 'allocators=[]', 'session=enabled'],
 )
