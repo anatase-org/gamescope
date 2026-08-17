@@ -7334,8 +7334,8 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 			( vblank || ( !frameGenerationOverlay &&
 			  steamcompmgr_can_latch_frame_generation_between_vblanks() ) ) &&
 			( entry_window
-			? steamcompmgr_should_vblank_window( true, vblank_idx, entry_window, now )
-			: steamcompmgr_should_vblank_window( true, vblank_idx ) );
+			? steamcompmgr_should_vblank_window( steamcompmgr_window_should_limit_fps( entry_window ), vblank_idx, entry_window, now )
+			: steamcompmgr_should_vblank_window( false, vblank_idx ) );
 
 		if ( fifoPaced && ( !entry_vblank || fifo_win_seqs.count( entry.winSeq ) > 0 ) )
 		{
@@ -7407,8 +7407,8 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 			( vblank || ( !frameGenerationOverlay &&
 			  steamcompmgr_can_latch_frame_generation_between_vblanks() ) ) &&
 			( entry_window
-				? steamcompmgr_should_vblank_window( true, vblank_idx, entry_window, now )
-				: steamcompmgr_should_vblank_window( true, vblank_idx ) );
+				? steamcompmgr_should_vblank_window( steamcompmgr_window_should_limit_fps( entry_window ), vblank_idx, entry_window, now )
+				: steamcompmgr_should_vblank_window( false, vblank_idx ) );
 
 		if ( fifoPaced && ( !entry_vblank || fifo_win_seqs.count( entry.winSeq ) > 0 ) )
 		{
