@@ -7997,7 +7997,7 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 		gpuvis_trace_printf( "pushing wait for commit %lu win %lx", newCommit->commitID, w->type == steamcompmgr_win_type_t::XWAYLAND ? w->xwayland().id : 0 );
 		bool bCommitPending = true;
 		{
-			newCommit->SetFence( fence, mango_nudge, doneCommits );
+			newCommit->SetFence( fence, mango_nudge, 0, doneCommits );
 			if ( bKnownReady )
 				newCommit->Signal();
 			else if ( fence < 0 )

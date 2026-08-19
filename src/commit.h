@@ -35,7 +35,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 
 	// Returns true if we had a fence that was closed.
 	bool CloseFenceInternal();
-	void SetFence( int nFence, bool bMangoNudge, const std::shared_ptr<CommitDoneList_t> &pDoneCommits );
+	void SetFence( int nFence, bool bMangoNudge, uint32_t uMangoMsgType, const std::shared_ptr<CommitDoneList_t> &pDoneCommits );
 
 	bool ShouldPreemptivelyUpscale( GamescopeUpscaleFilter eFilter, GamescopeUpscaleScaler eScaler );
 	void SetReleasePoint( std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint );
@@ -83,5 +83,6 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 	std::mutex m_WaitableCommitStateMutex;
 	int m_nCommitFence = -1;
 	bool m_bMangoNudge = false;
+	uint32_t m_uMangoMsgType = 0;
 	std::shared_ptr<CommitDoneList_t> m_pDoneCommits; // I hate this
 };
