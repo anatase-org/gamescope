@@ -1,7 +1,10 @@
 #include <sys/ipc.h>
 #include <unistd.h>
 #include <sys/msg.h>
-#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include "steamcompmgr.hpp"
 #include "refresh_rate.h"
@@ -9,6 +12,8 @@
 
 static bool inited = false;
 static int msgid = 0;
+static std::mutex s_SnapshotMutex;
+static std::unordered_map<uint32_t, MangoappSnapshot_t> s_ConnectorSnapshots;
 extern bool g_bAppWantsHDRCached;
 extern uint32_t g_focusedBaseAppId;
 
@@ -32,53 +37,94 @@ struct mangoapp_msg_v1 {
     bool bAppWantsHDR : 1;
     bool bSteamFocused : 1;
     char engineName[40];
-    uint64_t frameGenerationOutputFrametimeNs; // completed output flip interval, or UINT64_MAX
-    uint8_t frameGenerationEnabled; // 0 disables the frame generation HUD additions
-    
+    uint64_t frameGenerationOutputFrametimeNs;
+    uint8_t frameGenerationEnabled;
+
     // WARNING: Always ADD fields, never remove or repurpose fields
-} __attribute__((packed)) mangoapp_msg_v1;
+} __attribute__((packed));
 
 void init_mangoapp(){
     int key = ftok("mangoapp", 65);
     msgid = msgget(key, 0666 | IPC_CREAT);
-    mangoapp_msg_v1.hdr.msg_type = 1;
-    mangoapp_msg_v1.hdr.version = 1;
-    mangoapp_msg_v1.fsrUpscale = 0;
-    mangoapp_msg_v1.fsrSharpness = 0;
     inited = true;
 }
 
-static void mangoapp_send_update( uint64_t visible_frametime, uint64_t app_frametime_ns,
-    uint64_t latency_ns, uint64_t frame_generation_output_frametime_ns,
-    bool frame_generation_enabled ) {
+void mangoapp_set_connector_snapshots( std::unordered_map<uint32_t, MangoappSnapshot_t> snapshots )
+{
+    std::unique_lock lock( s_SnapshotMutex );
+    s_ConnectorSnapshots = std::move( snapshots );
+}
+
+static void mangoapp_send_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns,
+    uint64_t frame_generation_output_frametime_ns, bool frame_generation_enabled,
+    uint32_t uMsgType = k_uMangoappLegacyMsgType ) {
     if (!inited)
         init_mangoapp();
 
-    mangoapp_msg_v1.visible_frametime_ns = visible_frametime;
-    mangoapp_msg_v1.fsrUpscale = g_bFSRActive;
-    mangoapp_msg_v1.fsrSharpness = g_upscaleFilterSharpness;
-    mangoapp_msg_v1.app_frametime_ns = app_frametime_ns;
-    mangoapp_msg_v1.latency_ns = latency_ns;
-    mangoapp_msg_v1.pid = focusWindow_pid;
-    mangoapp_msg_v1.outputWidth = g_nOutputWidth;
-    mangoapp_msg_v1.outputHeight = g_nOutputHeight;
-    mangoapp_msg_v1.displayRefresh = (uint16_t) gamescope::ConvertmHzToHz( g_nOutputRefresh );
-    mangoapp_msg_v1.bAppWantsHDR = g_bAppWantsHDRCached;
-    mangoapp_msg_v1.bSteamFocused = g_focusedBaseAppId == 769;
-    memset(mangoapp_msg_v1.engineName, 0, sizeof(mangoapp_msg_v1.engineName));
-    std::shared_ptr<std::string> engine = focusWindow_engine;
-    if (engine)
-        engine->copy(mangoapp_msg_v1.engineName, sizeof(mangoapp_msg_v1.engineName) / sizeof(char));
+    MangoappSnapshot_t snapshot;
+    if ( uMsgType == k_uMangoappLegacyMsgType )
+    {
+        snapshot.bFSRActive = g_bFSRActive;
+        snapshot.uFSRSharpness = (uint8_t) g_upscaleFilterSharpness;
+        snapshot.nPid = focusWindow_pid;
+        snapshot.uOutputWidth = g_nOutputWidth;
+        snapshot.uOutputHeight = g_nOutputHeight;
+        snapshot.nOutputRefreshmHz = g_nOutputRefresh;
+        snapshot.bAppWantsHDR = g_bAppWantsHDRCached;
+        snapshot.bSteamFocused = g_focusedBaseAppId == 769;
+        snapshot.pEngineName = focusWindow_engine;
+    }
     else
-        std::string("gamescope").copy(mangoapp_msg_v1.engineName, sizeof(mangoapp_msg_v1.engineName) / sizeof(char));
-    mangoapp_msg_v1.frameGenerationOutputFrametimeNs = frame_generation_output_frametime_ns;
-    mangoapp_msg_v1.frameGenerationEnabled = frame_generation_enabled;
-    msgsnd(msgid, &mangoapp_msg_v1, sizeof(mangoapp_msg_v1) - sizeof(mangoapp_msg_v1.hdr.msg_type), IPC_NOWAIT);
+    {
+        std::unique_lock lock( s_SnapshotMutex );
+        auto iter = s_ConnectorSnapshots.find( uMsgType );
+        if ( iter == s_ConnectorSnapshots.end() )
+            return;
+        snapshot = iter->second;
+    }
+
+    struct mangoapp_msg_v1 msg = {};
+    msg.hdr.version = 1;
+    msg.hdr.msg_type = uMsgType;
+    msg.visible_frametime_ns = visible_frametime;
+    msg.app_frametime_ns = app_frametime_ns;
+    msg.latency_ns = latency_ns;
+    msg.fsrUpscale = snapshot.bFSRActive;
+    msg.fsrSharpness = snapshot.uFSRSharpness;
+    msg.pid = snapshot.nPid;
+    msg.outputWidth = snapshot.uOutputWidth;
+    msg.outputHeight = snapshot.uOutputHeight;
+    msg.displayRefresh = (uint16_t) gamescope::ConvertmHzToHz( snapshot.nOutputRefreshmHz );
+    msg.bAppWantsHDR = snapshot.bAppWantsHDR;
+    msg.bSteamFocused = snapshot.bSteamFocused;
+    if (snapshot.pEngineName)
+        snapshot.pEngineName->copy(msg.engineName, sizeof(msg.engineName) / sizeof(char));
+    else
+        std::string("gamescope").copy(msg.engineName, sizeof(msg.engineName) / sizeof(char));
+
+    msg.frameGenerationOutputFrametimeNs = frame_generation_output_frametime_ns;
+    msg.frameGenerationEnabled = frame_generation_enabled;
+    msgsnd(msgid, &msg, sizeof(msg) - sizeof(msg.hdr.msg_type), IPC_NOWAIT);
 }
 
-void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns ) {
+void mangoapp_nudge_app_frame( uint32_t uMsgType, uint64_t ulNow )
+{
+    static std::mutex s_FrameTimeMutex;
+    static std::unordered_map<uint32_t, uint64_t> s_LastFrameTimes;
+
+    uint64_t frametime;
+    {
+        std::unique_lock lock( s_FrameTimeMutex );
+        auto iter = s_LastFrameTimes.find( uMsgType );
+        frametime = ( iter != s_LastFrameTimes.end() ) ? ulNow - iter->second : 0;
+        s_LastFrameTimes[ uMsgType ] = ulNow;
+    }
+    mangoapp_update( uint64_t(~0ull), frametime, uint64_t(~0ull), uMsgType );
+}
+
+void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns, uint32_t uMsgType ) {
     mangoapp_send_update( visible_frametime, app_frametime_ns, latency_ns, uint64_t(~0ull),
-        steamcompmgr_frame_generation_enabled_for_focus() );
+        uMsgType == k_uMangoappLegacyMsgType && steamcompmgr_frame_generation_enabled_for_focus(), uMsgType );
 }
 
 extern uint64_t g_uCurrentBasePlaneCommitID;
