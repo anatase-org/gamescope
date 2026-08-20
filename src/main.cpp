@@ -819,6 +819,10 @@ int main(int argc, char **argv)
 					disableInternalPq = false;
 				} else if (strcmp(opt_name, "xwayland-count") == 0) {
 					g_nXWaylandCount = parse_integer( optarg, opt_name );
+					if ( g_nXWaylandCount < 1 ) {
+						fprintf( stderr, "gamescope: invalid value for --xwayland-count, must be at least 1\n" );
+						exit(1);
+					}
 				} else if (strcmp(opt_name, "composite-debug") == 0) {
 					cv_composite_debug |= CompositeDebugFlag::Markers;
 					cv_composite_debug |= CompositeDebugFlag::PlaneBorders;
