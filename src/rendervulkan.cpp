@@ -4510,6 +4510,31 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	return true;
 }
 
+// Without a swapchain the shared images are ours to make, so they wait for their first use.
+static bool vulkan_defer_output_images()
+{
+	return !GetBackend()->UsesVulkanSwapchain();
+}
+
+static bool vulkan_ensure_output_images()
+{
+	if ( !vulkan_defer_output_images() )
+		return true;
+
+	VulkanOutput_t *pOutput = &g_output;
+	if ( !pOutput->outputImages.empty() && pOutput->outputImages[0] )
+		return true;
+
+	vk_log.debugf( "Making the shared output images on first use" );
+	if ( vulkan_make_output_images( pOutput ) )
+		return true;
+
+	// A half-made set would pass the check above, so the next use tries again from nothing.
+	pOutput->outputImages.clear();
+	pOutput->outputImagesPartialOverlay.clear();
+	return false;
+}
+
 bool vulkan_remake_output_images()
 {
 	VulkanOutput_t *pOutput = &g_output;
@@ -4522,6 +4547,14 @@ bool vulkan_remake_output_images()
 		pScreenshotTexture = nullptr;
 	for (auto& pCaptureTexture : pOutput->pCaptureTextures)
 		pCaptureTexture = nullptr;
+
+	if ( vulkan_defer_output_images() )
+	{
+		pOutput->outputImages.clear();
+		pOutput->outputImagesPartialOverlay.clear();
+		pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+		return true;
+	}
 
 	bool bRet = vulkan_make_output_images( pOutput );
 	assert( bRet );
@@ -4601,7 +4634,9 @@ bool vulkan_make_output()
 			return false;
 		}
 
-		if ( !vulkan_make_output_images( pOutput ) )
+		if ( vulkan_defer_output_images() )
+			pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
+		else if ( !vulkan_make_output_images( pOutput ) )
 			return false;
 	}
 
@@ -5324,6 +5359,9 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool applyRotation, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
+	if ( !pOutputOverride && !vulkan_ensure_output_images() )
+		return std::nullopt;
+
 	FrameInfo_t sampledFrame = *frameInfo;
 	uint32_t predecodedLutMask = 0;
 	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
@@ -5414,7 +5452,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())
 	{
-		if (frameInfo->layers.get( 0 ).tex)
+		if (frameInfo->layers.count() > 0 && frameInfo->layers.get( 0 ).tex)
 		{
 			ReshadeEffectKey key
 			{
@@ -5441,7 +5479,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		g_reshadeManager.clear();
 	}
 
-	const auto &base = frameInfo->layers[0];
+	const FrameInfo_t::Layer_t emptyBase{};
+	const auto &base = frameInfo->layers.count() > 0 ? frameInfo->layers[0] : emptyBase;
 	const auto *copySource = base.tex && base.tex->linearSource && base.tex->linearSourceDirty ? base.tex->linearSource.get() : base.tex.get();
 	const bool canCopyBase = frameInfo->layers.count() > 0 && copySource && !partial && !pOutputOverride && !pPipewireTexture &&
 		!GetBackend()->UsesVulkanSwapchain() && !applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 &&
