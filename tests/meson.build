@@ -22,6 +22,14 @@ test_surface_damage = executable(
 )
 test('surface-damage', test_surface_damage)
 
+test_vblank_schedule = executable(
+	'test_vblank_schedule',
+	'test_vblank_schedule.cpp',
+	include_directories: [srcdir],
+	cpp_args: gamescope_cpp_args,
+)
+test('vblank-schedule', test_vblank_schedule)
+
 if catch2_dep.found()
 	unittest_src = []
 	foreach src : gamescope_core_src + ['Script/Script.cpp', 'convar_script.cpp']

@@ -18,6 +18,7 @@
 #include "steamcompmgr.hpp"
 #include "main.hpp"
 #include "refresh_rate.h"
+#include "Utils/VBlankSchedule.h"
 
 LogScope g_VBlankLog("vblank");
 
@@ -85,17 +86,9 @@ namespace gamescope
 		const uint64_t ulIntervalNSecs = mHzToRefreshCycle( GetRefresh() );
 		const uint64_t ulNow = get_time_in_nanos();
 
-		uint64_t ulTargetPoint = GetLastVBlank() + ulIntervalNSecs - ulOffset;
-		const uint64_t ulProcessed = m_ulLastProcessedVBlank;
 		const uint64_t ulLateMargin = m_bCurrentlyCompositing ? m_ulVBlankDrawBufferRedZone : 0;
-		// Page-flip feedback can arrive after the timer was rearmed. Do not issue
-		// another wakeup for an already processed refresh, even if its predicted
-		// timestamp moved slightly. A late, unprocessed refresh can use the margin.
-		while (ulTargetPoint + ulOffset <= ulProcessed + ulIntervalNSecs / 2 ||
-			(ulTargetPoint < ulNow && ulNow - ulTargetPoint > ulLateMargin))
-			ulTargetPoint += ulIntervalNSecs;
-
-		return ulTargetPoint;
+		return NextVBlankWakeup( GetLastVBlank(), ulIntervalNSecs, ulOffset,
+			m_ulLastProcessedVBlank, ulNow, ulLateMargin );
 	}
 
 	VBlankScheduleTime CVBlankTimer::CalcNextWakeupTime( bool bPreemptive )
