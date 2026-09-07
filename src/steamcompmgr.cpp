@@ -3926,7 +3926,10 @@ is_focus_priority_greater( steamcompmgr_win_t *a, steamcompmgr_win_t *b )
 		!a->xwayland().transientFor != !b->xwayland().transientFor )
 		return !a->xwayland().transientFor;
 
-	if ( win_has_game_id( a ) && a->xwayland().map_sequence != b->xwayland().map_sequence )
+	// A newly mapped sibling menu must displace an older menu even if a focus
+	// pass raised the older one between the new window's creation and mapping.
+	if ( ( win_has_game_id( a ) || ( win_maybe_a_dropdown( a ) && win_maybe_a_dropdown( b ) ) ) &&
+		a->xwayland().map_sequence != b->xwayland().map_sequence )
 		return a->xwayland().map_sequence > b->xwayland().map_sequence;
 
 	// The damage sequences are only relevant for game windows.
@@ -4456,20 +4459,69 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 	steamcompmgr_win_t *w;
 	w = ctx->focus.focusWindow;
 
+	steamcompmgr_win_t *mouseBaseWindow = ctx->focus.focusWindow;
 	if ( inputFocus == ctx->focus.focusWindow && ctx->focus.overrideWindow )
+		inputFocus = ctx->focus.overrideWindow;
+
+	// X routes input by stacking. Raise the mouse pick together with its menus,
+	// preserving the parent menu above the base when a submenu takes the pick.
+	if ( mouseBaseWindow && mouseBaseWindow != inputFocus )
 	{
-		if ( ctx->list[0].xwayland().id != ctx->focus.overrideWindow->xwayland().id )
+		size_t nWindowCount = 0;
+		steamcompmgr_win_t *pFirstMapped = nullptr;
+		for ( steamcompmgr_win_t *pWindow = ctx->list; pWindow; pWindow = pWindow->xwayland().next )
 		{
-			XRaiseWindow(ctx->dpy, ctx->focus.overrideWindow->xwayland().id);
+			++nWindowCount;
+			if ( !pFirstMapped && pWindow->xwayland().a.map_state == IsViewable )
+				pFirstMapped = pWindow;
+		}
+
+		auto isMenu = [&]( steamcompmgr_win_t *candidate )
+		{
+			// Bound the transient walk so malformed cycles cannot hang the focus pass.
+			steamcompmgr_win_t *ancestor = candidate;
+			for ( size_t remaining = nWindowCount; remaining && ancestor &&
+				ancestor->xwayland().a.map_state == IsViewable && win_maybe_a_dropdown( ancestor ) &&
+				is_good_override_candidate( ancestor, mouseBaseWindow ); --remaining )
+			{
+				if ( ancestor->xwayland().transientFor == mouseBaseWindow->xwayland().id )
+					return true;
+				// No hint means app ownership. Explicit links elsewhere still win.
+				if ( !ancestor->xwayland().transientFor )
+					return true;
+				ancestor = find_win( ctx, ancestor->xwayland().transientFor, false );
+			}
+			return false;
+		};
+
+		bool bNeedsRestack = pFirstMapped != inputFocus;
+		bool bSeenBase = false;
+		for ( steamcompmgr_win_t *pWindow = ctx->list; !bNeedsRestack && pWindow; pWindow = pWindow->xwayland().next )
+		{
+			if ( pWindow->xwayland().a.map_state != IsViewable || pWindow == inputFocus )
+				continue;
+			if ( pWindow == mouseBaseWindow )
+				bSeenBase = true;
+			else if ( isMenu( pWindow ) == bSeenBase )
+				bNeedsRestack = true; // A non-menu window is above the base, or a menu is below it.
+		}
+
+		if ( bNeedsRestack && mouseBaseWindow->xwayland().a.map_state == IsViewable &&
+			inputFocus->xwayland().a.map_state == IsViewable )
+		{
+			std::vector<Window> order{ inputFocus->xwayland().id };
+			for ( steamcompmgr_win_t *pWindow = ctx->list; pWindow; pWindow = pWindow->xwayland().next )
+			{
+				if ( pWindow != inputFocus && pWindow != mouseBaseWindow && isMenu( pWindow ) )
+					order.push_back( pWindow->xwayland().id );
+			}
+			order.push_back( mouseBaseWindow->xwayland().id );
+			inputFocus->Raise();
+			XRestackWindows( ctx->dpy, order.data(), order.size() );
 		}
 	}
-	else
-	{
-		if ( ctx->list[0].xwayland().id != inputFocus->xwayland().id )
-		{
-			XRaiseWindow(ctx->dpy, inputFocus->xwayland().id);
-		}
-	}
+	else if ( ctx->list[0].xwayland().id != inputFocus->xwayland().id )
+		inputFocus->Raise();
 
 	// X confines the pointer to the screen, so a screen-sized focus window only
 	// sees all of it at the origin. Place it there once, a client that moves it
