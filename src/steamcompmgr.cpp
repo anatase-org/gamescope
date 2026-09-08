@@ -7722,7 +7722,7 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 		if ( entry.desiredPresentTime > next_refresh_time )
 		{
 			commits_before_their_time.push_back( entry );
-			break;
+			continue;
 		}
 
 		for (const auto& xdg_win : g_steamcompmgr_xdg_wins)
