@@ -484,6 +484,7 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 				virtualWhite = glm::vec2(0.0f); // Steam's neutral D65 setting is not an explicit white-point effect.
 			calcColorTransform<s_nLutEdgeSize3d>( &g_tmpLut1d, s_nLutSize1d, &g_tmpLut3d, inputColorimetry, inputEOTF,
 				outputEncodingColorimetry, newColorMgmt.outputEncodingEOTF,
+				displayColorimetry,
 				virtualWhite, newColorMgmt.chromaticAdaptationMode,
 				colorMapping, newColorMgmt.nightmode, tonemapping, pLook, flGain );
 

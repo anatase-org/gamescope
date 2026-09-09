@@ -45,3 +45,13 @@ if catch2_dep.found()
 	)
 	test('convar', test_convar)
 endif
+
+# Keep the color regression available when Catch2 is not installed.
+test_color_helpers = executable(
+	'test_color_helpers',
+	['test_color_helpers.cpp', srcdir / 'color_helpers.cpp'],
+	include_directories: [srcdir],
+	dependencies: [glm_dep],
+	cpp_args: gamescope_cpp_args,
+)
+test('color-helpers', test_color_helpers)
