@@ -226,6 +226,12 @@ namespace gamescope
                 return "Refresh Cycle Only Change Refresh Rate";
             case GAMESCOPE_CONTROL_FEATURE_MURA_CORRECTION:
                 return "Mura Correction";
+            case GAMESCOPE_CONTROL_FEATURE_LOOK:
+                return "Look";
+            case GAMESCOPE_CONTROL_FEATURE_PERF_QUERY:
+                return "Performance Query";
+            case GAMESCOPE_CONTROL_FEATURE_KEYBOARD_LAYOUT:
+                return "Keyboard Layout";
             default:
                 return "Unknown";
         }
