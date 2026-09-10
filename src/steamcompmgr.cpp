@@ -956,6 +956,7 @@ struct global_focus_t : public focus_t
 
 	GamescopeUpscaleFilter eUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
+	int nUpscaleSharpness = 0;
 	// Cleanup for the previous pre-emptive upscale, kept a frame behind.
 	std::optional<uint64_t> oLastPreemptiveUpscaleSeqNo;
 	std::vector<TempUpscaleImage_t> UpscaleImages;
@@ -2590,9 +2591,11 @@ static void paint_pipewire()
 	const UpscaleSettings_t upscaleSettings = GetUpscaleSettings(
 		GetCurrentFocus() && window_is_steam( GetCurrentFocus()->focusWindow ),
 		g_wantedUpscaleFilter,
-		g_wantedUpscaleScaler );
+		g_wantedUpscaleScaler,
+		g_upscaleFilterSharpness );
 	frameInfo.eUpscaleFilter = upscaleSettings.eFilter;
 	frameInfo.eUpscaleScaler = upscaleSettings.eScaler;
+	frameInfo.nUpscaleSharpness = upscaleSettings.nSharpness;
 
 	// Apply screenshot-style color management.
 	for ( uint32_t nInputEOTF = 0; nInputEOTF < EOTF_Count; nInputEOTF++ )
@@ -2898,6 +2901,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 	frameInfo.dpms = dpms;
 	frameInfo.eUpscaleFilter = pFocus->eUpscaleFilter;
 	frameInfo.eUpscaleScaler = pFocus->eUpscaleScaler;
+	frameInfo.nUpscaleSharpness = pFocus->nUpscaleSharpness;
 
 	// If the window we'd paint as the base layer is the streaming client,
 	// find the video underlay and put it up first in the scenegraph
@@ -3361,6 +3365,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 				FrameInfo_t renderSizeScreenshotFrameInfo{};
 				renderSizeScreenshotFrameInfo.eUpscaleFilter = frameInfo.eUpscaleFilter;
 				renderSizeScreenshotFrameInfo.eUpscaleScaler = frameInfo.eUpscaleScaler;
+				renderSizeScreenshotFrameInfo.nUpscaleSharpness = frameInfo.nUpscaleSharpness;
 				renderSizeScreenshotFrameInfo.applyOutputColorMgmt = true;
 				renderSizeScreenshotFrameInfo.outputEncodingEOTF = bHDRScreenshot ? EOTF_PQ : EOTF_Gamma22;
 				for ( uint32_t nInputEOTF = 0; nInputEOTF < EOTF_Count; nInputEOTF++ )
@@ -6746,7 +6751,7 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 	if ( ev->atom == ctx->atoms.gamescopeFSRSharpness || ev->atom == ctx->atoms.gamescopeSharpness )
 	{
 		g_upscaleFilterSharpness = (int)clamp( get_prop( ctx, ctx->root, ev->atom, 2 ), 0u, 20u );
-		if ( g_wantedUpscaleFilter == GamescopeUpscaleFilter::FSR || g_wantedUpscaleFilter == GamescopeUpscaleFilter::NIS )
+		if ( UpscaleFilterUsesSharpness( g_wantedUpscaleFilter ) )
 			hasRepaint = true;
 	}
 	if ( ev->atom == ctx->atoms.gamescopeFrameGenerationEnabled )
@@ -8015,6 +8020,7 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 			globalScaleRatio = 1.0f;
 			upscaledFrameInfo.eUpscaleFilter = pUpscaleFocus->eUpscaleFilter;
 			upscaledFrameInfo.eUpscaleScaler = pUpscaleFocus->eUpscaleScaler;
+			upscaledFrameInfo.nUpscaleSharpness = pUpscaleFocus->nUpscaleSharpness;
 			paint_window_commit( newCommit, w, w, &upscaledFrameInfo, nullptr );
 			upscaledFrameInfo.useFSRLayer0 = upscaledFrameInfo.eUpscaleFilter == GamescopeUpscaleFilter::FSR;
 			upscaledFrameInfo.useNISLayer0 = upscaledFrameInfo.eUpscaleFilter == GamescopeUpscaleFilter::NIS;
@@ -10155,9 +10161,11 @@ steamcompmgr_main(int argc, char **argv)
 			const UpscaleSettings_t upscaleSettings = GetUpscaleSettings(
 				window_is_steam( pPaintFocus->focusWindow ),
 				g_wantedUpscaleFilter,
-				g_wantedUpscaleScaler );
+				g_wantedUpscaleScaler,
+				g_upscaleFilterSharpness );
 			pPaintFocus->eUpscaleFilter = upscaleSettings.eFilter;
 			pPaintFocus->eUpscaleScaler = upscaleSettings.eScaler;
+			pPaintFocus->nUpscaleSharpness = upscaleSettings.nSharpness;
 
 			if ( vblank )
 			{
