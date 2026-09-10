@@ -3893,7 +3893,9 @@ namespace gamescope
 
 			bool bLayer0ScreenSize = close_enough(pFrameInfo->layers[0].scale.x, 1.0f) && close_enough(pFrameInfo->layers[0].scale.y, 1.0f);
 
-			bool bNeedsCompositeFromFilter = (pFrameInfo->eUpscaleFilter == GamescopeUpscaleFilter::NEAREST || pFrameInfo->eUpscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
+			GamescopeUpscaleFilter eLayer0Filter = pFrameInfo->layers.get( 0 ).filter;
+			bool bNeedsCompositeFromFilter = ( eLayer0Filter == GamescopeUpscaleFilter::NEAREST ||
+			                                   eLayer0Filter == GamescopeUpscaleFilter::PIXEL ) && !bLayer0ScreenSize;
 
 			bool bNeedsFullComposite = false;
 			bNeedsFullComposite |= cv_composite_force;
