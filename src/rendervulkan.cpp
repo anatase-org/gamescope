@@ -50,9 +50,13 @@
 #include "cs_composite_blur.h"
 #include "cs_composite_blur_cond.h"
 #include "cs_composite_rcas.h"
+#include "cs_composite_rcas_1px.h"
 #include "cs_composite_rcas_fp16.h"
+#include "cs_composite_rcas_fp16_1px.h"
 #include "cs_composite_rcas_rgba16f.h"
+#include "cs_composite_rcas_rgba16f_1px.h"
 #include "cs_composite_rcas_rgb10a2.h"
+#include "cs_composite_rcas_rgb10a2_1px.h"
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
 #include "cs_easu_rgba16f.h"
@@ -1141,12 +1145,40 @@ bool CVulkanDevice::createShaders()
 	SHADER(BLUR, cs_composite_blur);
 	SHADER(BLUR_COND, cs_composite_blur_cond);
 	SHADER(BLUR_FIRST_PASS, cs_gaussian_blur_horizontal);
-	SHADER(RCAS, cs_composite_rcas);
-	SHADER(RCAS_RGBA16F, cs_composite_rcas_rgba16f);
-	SHADER(RCAS_RGB10A2, cs_composite_rcas_rgb10a2);
+	if ( m_uVendorID == 0x5143 ) /* Qualcomm */
+	{
+		SHADER(RCAS, cs_composite_rcas_1px);
+	}
+	else
+	{
+		SHADER(RCAS, cs_composite_rcas);
+	}
+	if ( m_uVendorID == 0x5143 ) /* Qualcomm */
+	{
+		SHADER(RCAS_RGBA16F, cs_composite_rcas_rgba16f_1px);
+	}
+	else
+	{
+		SHADER(RCAS_RGBA16F, cs_composite_rcas_rgba16f);
+	}
+	if ( m_uVendorID == 0x5143 ) /* Qualcomm */
+	{
+		SHADER(RCAS_RGB10A2, cs_composite_rcas_rgb10a2_1px);
+	}
+	else
+	{
+		SHADER(RCAS_RGB10A2, cs_composite_rcas_rgb10a2);
+	}
 	if (m_bSupportsFp16)
 	{
+		if ( m_uVendorID == 0x5143 ) /* Qualcomm */
+	{
+		SHADER(RCAS_FP16, cs_composite_rcas_fp16_1px);
+	}
+	else
+	{
 		SHADER(RCAS_FP16, cs_composite_rcas_fp16);
+	}
 		SHADER(EASU, cs_easu_fp16);
 		SHADER(EASU_RGBA16F, cs_easu_fp16_rgba16f);
 		SHADER(NIS, cs_nis_fp16);

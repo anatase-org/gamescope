@@ -1,9 +1,13 @@
 #include "descriptor_set.h"
 
+#if FSR_RCAS_ONE_PIXEL
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+#else
 layout(
   local_size_x = 64,
   local_size_y = 1,
   local_size_z = 1) in;
+#endif
 
 layout(binding = 0, scalar)
 uniform layers_t {
@@ -125,6 +129,9 @@ void rcasComposite(uvec2 pos)
 
 void main()
 {
+#if FSR_RCAS_ONE_PIXEL
+    rcasComposite(gl_GlobalInvocationID.xy);
+#else
     // AMD recommends to use this swizzle and to process 4 pixels per invocation
     // for better cache utilisation.
     uvec2 pos = ARmp8x8(gl_LocalInvocationID.x) + uvec2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
@@ -135,4 +142,5 @@ void main()
     rcasComposite(pos);
     pos.x -= 8u;
     rcasComposite(pos);
+#endif
 }
