@@ -82,6 +82,7 @@ shader_src = [
   'shaders/cs_nis_fp16.comp',
   'shaders/cs_rgb_to_nv12.comp',
   'shaders/cs_rotation.comp',
+  'shaders/cs_sgsr.comp',
 ]
 
 spirv_shaders = glsl_generator.process(shader_src)

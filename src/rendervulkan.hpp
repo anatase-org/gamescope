@@ -327,6 +327,7 @@ struct FrameInfo_t
 {
 	bool useFSRLayer0;
 	bool useNISLayer0;
+	bool useSGSRLayer0;
 	// Upscale settings for this frame.
 	GamescopeUpscaleFilter eUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
@@ -411,8 +412,9 @@ struct FrameInfo_t
 		}
 
 		GamescopeUpscaleFilter shaderFilter() const {
-			return isScreenSize() || ( filter == GamescopeUpscaleFilter::LINEAR && viewConvertsToLinearAutomatically() )
-				? GamescopeUpscaleFilter::FROM_VIEW : filter;
+			const auto eFilter = filter == GamescopeUpscaleFilter::SGSR ? GamescopeUpscaleFilter::LINEAR : filter;
+			return isScreenSize() || ( eFilter == GamescopeUpscaleFilter::LINEAR && viewConvertsToLinearAutomatically() )
+				? GamescopeUpscaleFilter::FROM_VIEW : eFilter;
 		}
 
 		uint32_t integerWidth() const { return tex->width() / scale.x; }
@@ -750,6 +752,7 @@ enum ShaderType {
 	SHADER_TYPE_NIS,
 	SHADER_TYPE_RGB_TO_NV12,
 	SHADER_TYPE_ROTATION,
+	SHADER_TYPE_SGSR,
 
 	SHADER_TYPE_COUNT
 };
