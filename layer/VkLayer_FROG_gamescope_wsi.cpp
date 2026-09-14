@@ -418,6 +418,7 @@ namespace GamescopeWSILayer {
     GamescopeWaylandObjects waylandObjects;
     VkSurfaceKHR fallbackSurface;
     wl_surface* surface;
+    bool isNativeSurface;
 
     xcb_connection_t* connection;
     xcb_window_t window;
@@ -809,6 +810,7 @@ namespace GamescopeWSILayer {
         .display         = pCreateInfo->display,
         .waylandObjects  = waylandObjects,
         .surface         = pCreateInfo->surface,
+        .isNativeSurface = true,
         .flags           = gamescopeInstance->flags,
         .hdrOutput       = false, // XXXX FIXME FIXME FIXME //hdrOutput,
       });
@@ -999,7 +1001,9 @@ namespace GamescopeWSILayer {
       const VkAllocationCallbacks*       pAllocator) {
       if (auto state = GamescopeSurface::get(surface)) {
         pDispatch->DestroySurfaceKHR(instance, state->fallbackSurface, pAllocator);
-        wl_surface_destroy(state->surface);
+        if (!state->isNativeSurface) {
+          wl_surface_destroy(state->surface);
+        }
       }
       GamescopeSurface::remove(surface);
       pDispatch->DestroySurfaceKHR(instance, surface, pAllocator);
@@ -1105,6 +1109,7 @@ namespace GamescopeWSILayer {
         .waylandObjects  = waylandObjects,
         .fallbackSurface = fallbackSurface,
         .surface         = waylandSurface,
+        .isNativeSurface = false,
         .connection      = connection,
         .window          = window,
         .flags           = flags,
