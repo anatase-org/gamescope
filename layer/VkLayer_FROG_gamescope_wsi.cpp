@@ -7,6 +7,7 @@
 #include "gamescope-swapchain-client-protocol.h"
 #include "../src/color_helpers.h"
 #include "../src/layer_defines.h"
+#include "../src/Utils/Defer.h"
 
 #include <charconv>
 #include <cstdio>
@@ -384,20 +385,20 @@ namespace GamescopeWSILayer {
   }
 
   struct GamescopeWaylandObjects {
-    wl_compositor* compositor;
-    gamescope_swapchain_factory_v2* gamescopeSwapchainFactory;
+    std::unique_ptr<wl_compositor, decltype(&wl_compositor_destroy)> compositor{nullptr, wl_compositor_destroy};
+    std::unique_ptr<gamescope_swapchain_factory_v2, decltype(&gamescope_swapchain_factory_v2_destroy)>
+      gamescopeSwapchainFactory{nullptr, gamescope_swapchain_factory_v2_destroy};
 
     static GamescopeWaylandObjects get(wl_display *display) {
+      GamescopeWaylandObjects waylandObjects;
       wl_registry *registry = wl_display_get_registry(display);
       if (!registry)
         return {};
-      GamescopeWaylandObjects waylandObjects{};
-      wl_registry_add_listener(registry, &s_registryListener, reinterpret_cast<void *>(&waylandObjects));
-      // Dispatch then roundtrip to get registry info.
-      wl_display_dispatch(display);
-      wl_display_roundtrip(display);
-      wl_registry_destroy(registry);
-
+      defer(wl_registry_destroy(registry));
+      wl_registry_add_listener(registry, &s_registryListener, &waylandObjects);
+      if (wl_display_dispatch(display) < 0 ||
+          wl_display_roundtrip(display) < 0)
+        return {};
       return waylandObjects;
     }
 
@@ -411,11 +412,12 @@ namespace GamescopeWSILayer {
       auto objects = reinterpret_cast<GamescopeWaylandObjects *>(data);
 
       if (interface == "wl_compositor"sv) {
-        objects->compositor = reinterpret_cast<wl_compositor *>(
-          wl_registry_bind(registry, name, &wl_compositor_interface, version));
+        objects->compositor.reset(reinterpret_cast<wl_compositor *>(
+          wl_registry_bind(registry, name, &wl_compositor_interface, version)));
       } else if (interface == "gamescope_swapchain_factory_v2"sv) {
-        objects->gamescopeSwapchainFactory = reinterpret_cast<gamescope_swapchain_factory_v2 *>(
-          wl_registry_bind(registry, name, &gamescope_swapchain_factory_v2_interface, version));
+        objects->gamescopeSwapchainFactory.reset(reinterpret_cast<gamescope_swapchain_factory_v2 *>(
+          wl_registry_bind(registry, name, &gamescope_swapchain_factory_v2_interface, version)));
+
       }
     },
     .global_remove = [](void* data, wl_registry* registry, uint32_t name) {
@@ -1081,7 +1083,7 @@ namespace GamescopeWSILayer {
         return VK_ERROR_SURFACE_LOST_KHR;
       }
 
-      wl_surface* waylandSurface = wl_compositor_create_surface(waylandObjects.compositor);
+      wl_surface* waylandSurface = wl_compositor_create_surface(waylandObjects.compositor.get());
       if (!waylandSurface) {
         fprintf(stderr, "[Gamescope WSI] Failed to create wayland surface - xid: 0x%x\n", window);
         return VK_ERROR_SURFACE_LOST_KHR;
@@ -1351,7 +1353,7 @@ namespace GamescopeWSILayer {
       }
 
       gamescope_swapchain *gamescopeSwapchainObject = gamescope_swapchain_factory_v2_create_swapchain(
-        gamescopeSurface->waylandObjects.gamescopeSwapchainFactory,
+        gamescopeSurface->waylandObjects.gamescopeSwapchainFactory.get(),
         gamescopeSurface->surface);
 
       {
