@@ -78,6 +78,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cfloat>
 #include <list>
 #include <set>
 
