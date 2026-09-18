@@ -93,7 +93,14 @@ namespace gamescope
 
 	VBlankScheduleTime CVBlankTimer::CalcNextWakeupTime( bool bPreemptive )
 	{
-		const int nRefreshRate = GetRefresh();
+		std::unique_lock lock( m_ScheduleMutex );
+		return CalcNextWakeupTimeLocked( bPreemptive );
+	}
+
+	VBlankScheduleTime CVBlankTimer::CalcNextWakeupTimeLocked( bool bPreemptive )
+	{
+		const int nNestedRefresh = g_nNestedRefresh;
+		const int nRefreshRate = nNestedRefresh ? nNestedRefresh : g_nOutputRefresh;
 		const uint64_t ulRefreshInterval = mHzToRefreshCycle( nRefreshRate );
 
 		bool bVRR = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive();
@@ -170,6 +177,15 @@ namespace gamescope
 				VBlankDebugSpew( ulOffset, ulDrawTime, ulRedZone );
 		}
 
+		if ( GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0 && !bVRR )
+			return VBlank::Next({
+				.ulLastVBlank = GetLastVBlank(),
+				.ulInterval = ulRefreshInterval,
+				.ulOffset = ulOffset,
+				.ulNow = get_time_in_nanos(),
+				.bRateOverride = true,
+			}, m_LastIndependentSchedule );
+
 		const uint64_t ulScheduledWakeupPoint = GetNextVBlank( ulOffset );
 		const uint64_t ulTargetVBlank = ulScheduledWakeupPoint + ulOffset;
 
@@ -231,7 +247,7 @@ namespace gamescope
 
 		if ( UsingTimerFD() )
 		{
-			m_TimerFDSchedule = CalcNextWakeupTime( bPreemptive );
+			m_TimerFDSchedule = CalcNextWakeupTimeLocked( bPreemptive );
 
 			ITimerWaitable::ArmTimer( m_TimerFDSchedule.ulScheduledWakeupPoint );
 		}
@@ -259,6 +275,7 @@ namespace gamescope
 
 
 			m_ulLastProcessedVBlank = m_TimerFDSchedule.ulTargetVBlank;
+			m_LastIndependentSchedule = m_TimerFDSchedule;
 			m_PendingVBlank = VBlankTime
 			{
 				.schedule = m_TimerFDSchedule,
@@ -312,6 +329,8 @@ namespace gamescope
 				return;
 			}
 
+			std::unique_lock lock( m_ScheduleMutex );
+			m_LastIndependentSchedule = time.schedule;
 			gpuvis_trace_printf( "got vblank" );
 			m_ulLastProcessedVBlank = time.schedule.ulTargetVBlank;
 			m_PendingVBlank = time;

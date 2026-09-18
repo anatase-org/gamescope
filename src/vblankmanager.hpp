@@ -2,18 +2,10 @@
 
 #include <optional>
 #include "waitable.h"
+#include "Utils/VBlankSchedule.h"
 
 namespace gamescope
 {
-    struct VBlankScheduleTime
-    {
-        // The expected time for the vblank we want to target.
-        uint64_t ulTargetVBlank = 0;
-        // The vblank offset by the redzone/scheduling calculation.
-        // This is when we want to wake-up by to meet that vblank time above.
-        uint64_t ulScheduledWakeupPoint = 0;
-    };
-
     struct VBlankTime
     {
         VBlankScheduleTime schedule;
@@ -63,6 +55,9 @@ namespace gamescope
         int GetFD() final;
         void OnPollIn() final;
     private:
+        VBlankScheduleTime CalcNextWakeupTimeLocked( bool bPreemptive );
+        VBlankScheduleTime m_LastIndependentSchedule{};
+
         void VBlankDebugSpew( uint64_t ulOffset, uint64_t ulDrawTime, uint64_t ulRedZone );
 
         uint64_t m_ulTargetVBlank = 0;
