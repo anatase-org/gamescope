@@ -2890,6 +2890,9 @@ namespace gamescope
             {
                 abort();
             }
+
+            // Reading also queues releases and presentation feedback for steamcompmgr.
+            nudge_steamcompmgr();
         }
     }
 
