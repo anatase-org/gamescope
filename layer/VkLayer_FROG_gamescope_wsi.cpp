@@ -1017,14 +1017,13 @@ namespace GamescopeWSILayer {
             VkInstance                   instance,
             VkSurfaceKHR                 surface,
       const VkAllocationCallbacks*       pAllocator) {
-      if (auto state = GamescopeSurface::get(surface)) {
-        pDispatch->DestroySurfaceKHR(instance, state->fallbackSurface, pAllocator);
-        if (!state->isNativeSurface) {
-          wl_surface_destroy(state->surface);
-        }
-      }
+      auto state = GamescopeSurface::get(surface);
       GamescopeSurface::remove(surface);
+      if (state)
+        pDispatch->DestroySurfaceKHR(instance, state->fallbackSurface, pAllocator);
       pDispatch->DestroySurfaceKHR(instance, surface, pAllocator);
+      if (state && !state->isNativeSurface)
+        wl_surface_destroy(state->surface);
     }
 
     static VkResult EnumerateDeviceExtensionProperties(
