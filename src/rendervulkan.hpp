@@ -358,17 +358,17 @@ struct FrameInfo_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
 		SurfaceDamage damage;
-		int zpos;
+		int zpos = 0;
 
-		vec2_t offset;
-		vec2_t scale;
+		vec2_t offset = { 0.0f, 0.0f };
+		vec2_t scale = { 1.0f, 1.0f };
 
-		float opacity;
+		float opacity = 1.0f;
 
 		GamescopeUpscaleFilter filter = GamescopeUpscaleFilter::LINEAR;
 
-		bool blackBorder;
-		bool applyColorMgmt; // drm only
+		bool blackBorder = false;
+		bool applyColorMgmt = false; // drm only
 		bool outputColorMgmtApplied = false; // Skip LUTs when recompositing display-encoded output.
 
 		AlphaBlendingMode_t eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
@@ -379,7 +379,7 @@ struct FrameInfo_t
 		// Borrowed for the duration of a backend Present call.
 		int acquireFenceFd = -1;
 
-		GamescopeAppTextureColorspace colorspace;
+		GamescopeAppTextureColorspace colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
 
 		bool isYcbcr() const
 		{
