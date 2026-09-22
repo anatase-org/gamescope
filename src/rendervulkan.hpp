@@ -15,6 +15,7 @@
 
 #include "main.hpp"
 
+#include "Timeline.h"
 #include "gamescope_shared.h"
 #include "backend.h"
 #include "Timeline.h"
@@ -378,6 +379,8 @@ struct FrameInfo_t
 		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
 		// Borrowed for the duration of a backend Present call.
 		int acquireFenceFd = -1;
+
+		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
 
 		GamescopeAppTextureColorspace colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
 

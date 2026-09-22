@@ -5588,6 +5588,16 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	if (!copyOnly)
 		for (uint32_t i = 0; i < EOTF_Count; i++)
 			cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
+	// Subsurfaces and popups are fenced by the client's acquire point. Wait on it on
+	// the GPU rather than on this thread to avoid stalling the compositor.
+	for ( int i = 0; i < frameInfo->layers.count(); i++ )
+	{
+		const FrameInfo_t::Layer_t &layer = frameInfo->layers.get( i );
+		if ( layer.acquirePoint && !cmdBuffer->AddDependency(
+			layer.acquirePoint->GetTimeline()->ToVkSemaphore(), layer.acquirePoint->GetPoint() ) )
+			return std::nullopt;
+	}
+
 
 	if (copyOnly)
 		cmdBuffer->copyImage(base.tex, scanout);
