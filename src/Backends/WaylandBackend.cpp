@@ -2661,6 +2661,9 @@ namespace gamescope
             {
                 wl_keyboard_release( m_pKeyboard );
                 m_pKeyboard = nullptr;
+
+                m_bKeyboardEntered = false;
+                UpdateCursor();
             }
             else
             {
@@ -3061,6 +3064,12 @@ namespace gamescope
             {
                 wl_keyboard_release( m_pKeyboard );
                 m_pKeyboard = nullptr;
+
+                if ( m_bKeyboardEntered )
+                {
+                    m_bKeyboardEntered = false;
+                    ReleaseHeldKeys();
+                }
             }
             else
             {
