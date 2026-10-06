@@ -8,7 +8,12 @@ layout(
 layout(binding = 0, scalar)
 uniform layers_t {
     uvec4 c1, c2, c3, c4;
+    mat3x4 u_ctm;
 };
+
+const float u_linearToNits = 0.0f;
+const float u_nitsToLinear = 0.0f;
+#include "colorimetry.h"
 
 #define A_GPU 1
 #define A_GLSL 1
@@ -39,7 +44,11 @@ void easuPass(uvec2 pos)
     vec3 color;
     FsrEasuF(color, pos, c1, c2, c3, c4);
 #endif
-    imageStore(dst, ivec2(pos), vec4(color, 1));
+    // RCAS assumes a peak of 1.0; keep HDR in PQ while sharpening.
+    vec3 outputColor = vec3(color);
+    if (get_layer_colorspace(0) == colorspace_scRGB)
+        outputColor = scRGBEncodingToPQ((vec4(outputColor, 1.0f) * u_ctm).rgb);
+    imageStore(dst, ivec2(pos), vec4(outputColor, 1));
 }
 
 void main()

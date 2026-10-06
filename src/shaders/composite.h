@@ -129,7 +129,8 @@ vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace, bool encode
     {
         // Compact curves already contain the original LUT and its blend TF at
         // every 8-bit code. Other sampling geometries keep the original 3D LUT.
-        if (encodedInput && (c_colorMgmtMask & (1u << (2 * VKR_MAX_LAYERS + 3 * EOTF_Count + plane_eotf))) != 0) {
+        if (encodedInput && c_colorMgmtMask != 0xffffffffu &&
+            (c_colorMgmtMask & (1u << (2 * VKR_MAX_LAYERS + 3 * EOTF_Count + plane_eotf))) != 0) {
             // The nearest, unnormalized sampler selects exact 8-bit entries.
             vec3 coord = color * 255.0 + vec3(0.5, 256.5, 512.5);
             return vec3(textureLod(s_shaperLut[plane_eotf], coord.r, 0.0).r,
@@ -151,6 +152,18 @@ vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace, bool encode
 
 vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace) {
     return apply_layer_color_mgmt(color, layer, colorspace, false);
+}
+
+// EASU already applied the layer CTM and encoded scRGB as PQ for RCAS.
+vec3 apply_layer_color_mgmt_pq(vec3 pq, uint layer, uint colorspace) {
+    bool lutEnabled = c_colorMgmtMask == 0xffffffffu
+        ? textureQueryLevels(s_shaperLut[EOTF_PQ]) != 0
+        : (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + EOTF_PQ))) != 0;
+    if (lutEnabled && !c_itm_enable &&
+        !(layer == 0 && checkDebugFlag(compositedebug_Heatmap)))
+        return apply_layer_color_mgmt(pq, layer, colorspace, true);
+
+    return apply_layer_color_mgmt(pqToScRGBEncoding(pq), layer, colorspace);
 }
 
 vec4 sampleBilinear(sampler2D tex, vec2 coord, uint colorspace, bool unnormalized) {

@@ -5009,10 +5009,25 @@ struct EasuPushData_t
 	uvec4_t Const1;
 	uvec4_t Const2;
 	uvec4_t Const3;
+	glm::mat3x4 ctm;
 
-	EasuPushData_t(uint32_t inputX, uint32_t inputY, uint32_t tempX, uint32_t tempY)
+	EasuPushData_t(const FrameInfo_t::Layer_t *layer, uint32_t inputX, uint32_t inputY, uint32_t tempX, uint32_t tempY)
 	{
 		FsrEasuCon(&Const0.x, &Const1.x, &Const2.x, &Const3.x, inputX, inputY, inputX, inputY, tempX, tempY);
+
+		if (layer->ctm)
+		{
+			ctm = layer->ctm->View<glm::mat3x4>();
+		}
+		else
+		{
+			ctm = glm::mat3x4
+			{
+				1, 0, 0, 0,
+				0, 1, 0, 0,
+				0, 0, 1, 0
+			};
+		}
 	}
 };
 
@@ -5472,13 +5487,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		const ShaderType easuShader = is_fp16_fsr_target( fsrIntermediate.get() )
 			? SHADER_TYPE_EASU_RGBA16F
 			: SHADER_TYPE_EASU;
-		cmdBuffer->bindPipeline(g_device.pipeline(easuShader));
+		cmdBuffer->bindPipeline(g_device.pipeline(easuShader, 1, 0, 0, frameInfo->layers[0].colorspace));
 		cmdBuffer->bindTarget(fsrIntermediate);
 		cmdBuffer->bindTexture(0, frameInfo->layers[0].tex);
 		cmdBuffer->setTextureSrgb(0, true);
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
-		cmdBuffer->uploadConstants<EasuPushData_t>(inputX, inputY, tempX, tempY);
+		cmdBuffer->uploadConstants<EasuPushData_t>(&frameInfo->layers[0], inputX, inputY, tempX, tempY);
 
 		int pixelsPerGroup = 16;
 
