@@ -7,6 +7,16 @@
 int main()
 {
 	using gamescope::NextVBlankWakeup;
+	using gamescope::VBlankIndexAdvance;
+	using gamescope::CrossedVBlankBoundary;
+	assert( VBlankIndexAdvance( 1000, 1000, 100 ) == 0 );
+	assert( VBlankIndexAdvance( 1000, 900, 100 ) == 0 );
+	assert( VBlankIndexAdvance( 1000, 1101, 100 ) == 1 );
+	assert( VBlankIndexAdvance( 1000, 1500, 100 ) == 5 );
+	assert( !CrossedVBlankBoundary( 2, 2, 2 ) );
+	assert( !CrossedVBlankBoundary( 2, 3, 2 ) );
+	assert( CrossedVBlankBoundary( 1, 3, 2 ) );
+	assert( CrossedVBlankBoundary( 2, 7, 2 ) );
 	// Preserve the existing duplicate-refresh guard and late-frame allowance.
 	for ( uint64_t offset : { 0u, 100u, 400u } )
 	for ( uint64_t processed : { 0u, 1000u, 2000u, 2100u, 2500u } )

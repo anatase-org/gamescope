@@ -102,6 +102,7 @@ struct dma_buf_export_sync_file
 #include "vblankmanager.hpp"
 #include "frame_generation_config.hpp"
 #include "frame_generation_pacing.hpp"
+#include "Utils/VBlankSchedule.h"
 #include "log.hpp"
 #include "Utils/Defer.h"
 #include "win32_styles.h"
@@ -5937,6 +5938,9 @@ steamcompmgr_flush_frame_done( steamcompmgr_win_t *w )
 
 static std::optional<uint64_t> s_oLowestFPSLimitScheduleVRR;
 
+// Display refresh index of the preceding pass, including skipped refreshes.
+static uint64_t s_ulPrevVBlankIdx = 0;
+
 static bool steamcompmgr_can_latch_frame_generation_between_vblanks()
 {
 	return steamcompmgr_frame_generation_enabled_for_focus();
@@ -5997,8 +6001,8 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 	}
 	if ( frameGenerationOverlayActive )
 	{
-		return gamescope::FrameGenerationSourceSlotDue(
-			vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) );
+		return gamescope::FrameGenerationRationalSlotCrossed(
+			s_ulPrevVBlankIdx, vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) * 2u );
 	}
 
 	if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
@@ -6028,13 +6032,13 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 		{
 			if ( frameGenerationActive )
 			{
-				bSendCallback = gamescope::FrameGenerationSourceSlotDue(
-					vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) );
+				bSendCallback = gamescope::FrameGenerationRationalSlotCrossed(
+					s_ulPrevVBlankIdx, vblank_idx, uint64_t( nTargetFPS ), uint64_t( nRefreshHz ) * 2u );
 			}
 			else
 			{
 				int nVblankDivisor = nRefreshHz / nTargetFPS;
-				if ( vblank_idx % nVblankDivisor != 0 )
+				if ( !gamescope::CrossedVBlankBoundary( s_ulPrevVBlankIdx, vblank_idx, nVblankDivisor ) )
 					bSendCallback = false;
 			}
 		}
@@ -9185,6 +9189,17 @@ steamcompmgr_main(int argc, char **argv)
 		static uint64_t vblank_idx = 0;
 		if ( vblank )
 		{
+			// Count display vblanks, so a skipped or repeated pass cannot shift the limiter's phase.
+			static uint64_t s_ulLastPassVBlank = 0;
+			const uint64_t ulPassVBlank = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
+			s_ulPrevVBlankIdx = vblank_idx;
+			const uint64_t ulInterval = gamescope::mHzToRefreshCycle( GetVBlankTimer().GetRefresh() );
+			if ( s_ulLastPassVBlank == 0 )
+				vblank_idx = 1;
+			else
+				vblank_idx += gamescope::VBlankIndexAdvance( s_ulLastPassVBlank, ulPassVBlank, ulInterval );
+			s_ulLastPassVBlank = ulPassVBlank;
+
 			{
 				uint64_t now = get_time_in_nanos();
 
@@ -9231,8 +9246,6 @@ steamcompmgr_main(int argc, char **argv)
 
 		if ( vblank )
 		{
-			vblank_idx++;
-
 			int nRealRefreshmHz = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
 			g_SteamCompMgrAppRefreshCycle = gamescope::mHzToRefreshCycle( nRealRefreshmHz );
 			g_SteamCompMgrLimitedAppRefreshCycle = g_SteamCompMgrAppRefreshCycle;
@@ -9505,8 +9518,8 @@ steamcompmgr_main(int argc, char **argv)
 				frameGenerationPending && s_bFrameGenerationOutputTimerDue;
 			const bool frameGenerationVblankOutputDue = bFrameGeneration &&
 				!frameGenerationFreeRunning && vblank &&
-				gamescope::FrameGenerationOutputSlotDue(
-					vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
+				gamescope::FrameGenerationRationalSlotCrossed(
+					s_ulPrevVBlankIdx, vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
 			if ( frameGenerationVblankOutputDue )
 				vulkan_frame_generation_note_output_slot( frameGenerationPending );
 

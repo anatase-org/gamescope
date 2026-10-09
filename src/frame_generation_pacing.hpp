@@ -4,6 +4,13 @@
 
 namespace gamescope
 {
+	constexpr bool FrameGenerationRationalSlotCrossed(
+		uint64_t previousIndex, uint64_t index, uint64_t rate, uint64_t clockRate )
+	{
+		return rate != 0 && clockRate != 0 &&
+			index * rate / clockRate > previousIndex * rate / clockRate;
+	}
+
 	constexpr bool FrameGenerationRationalSlotDue(
 		uint64_t index, uint64_t rate, uint64_t clockRate )
 	{

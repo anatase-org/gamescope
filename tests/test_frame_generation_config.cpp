@@ -66,6 +66,14 @@ int main()
 	assert( sourceSlots == 45 );
 	assert( outputSlots == 90 );
 
+	// Repeated passes must not release a second frame, and a skipped refresh
+	// must not lose a source/output slot whose boundary was crossed.
+	assert( !FrameGenerationRationalSlotCrossed( 2, 2, 90, 120 ) );
+	assert( FrameGenerationRationalSlotCrossed( 1, 3, 90, 120 ) );
+	assert( !FrameGenerationRationalSlotCrossed( 3, 4, 90, 240 ) );
+	assert( FrameGenerationRationalSlotCrossed( 4, 6, 90, 240 ) );
+	assert( !FrameGenerationRationalSlotCrossed( 1, 2, 0, 120 ) );
+
 	// Let the client begin its next frame on the midpoint slot. Commit latching
 	// remains blocked separately until the midpoint drains, leaving one real.
 	assert( FrameGenerationCanRequestSourceFrame( 0, false ) );
