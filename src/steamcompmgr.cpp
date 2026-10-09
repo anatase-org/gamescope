@@ -7417,11 +7417,19 @@ error(Display *dpy, XErrorEvent *ev)
 	return 0;
 }
 
+#if HAVE_SYSTEMD
+void logind_sleep_stop();
+#endif
+
 static void
 steamcompmgr_exit(void)
 {
 	g_ImageWaiter.Shutdown();
 	vulkan_frame_generation_reset();
+
+#if HAVE_SYSTEMD
+	logind_sleep_stop();
+#endif
 
 	// Clean up any commits.
 	{
