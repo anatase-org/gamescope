@@ -17,6 +17,23 @@ int main()
 	assert( !CrossedVBlankBoundary( 2, 3, 2 ) );
 	assert( CrossedVBlankBoundary( 1, 3, 2 ) );
 	assert( CrossedVBlankBoundary( 2, 7, 2 ) );
+
+	// Small scheduling delays must not accumulate across callbacks (also used
+	// by frame-generation source pacing). A missed frame starts a fresh schedule.
+	using gamescope::NextFrameCallbackTime;
+	uint64_t previousCallback = 1'000'000'000;
+	constexpr uint64_t callbackInterval = 16'666'667;
+	for ( uint64_t i = 1; i <= 1000; ++i )
+	{
+		const uint64_t ideal = 1'000'000'000 + i * callbackInterval;
+		previousCallback = NextFrameCallbackTime( previousCallback, callbackInterval,
+			ideal + 176'000, callbackInterval / 2, 200'000 );
+		assert( previousCallback == ideal );
+	}
+	assert( NextFrameCallbackTime( 1000, 1000, 1900, 500, 100 ) == 2000 );
+	assert( NextFrameCallbackTime( 1000, 1000, 1899, 500, 100 ) == 1899 );
+	assert( NextFrameCallbackTime( 1000, 1000, 2499, 500, 100 ) == 2000 );
+	assert( NextFrameCallbackTime( 1000, 1000, 2500, 500, 100 ) == 2500 );
 	// Preserve the existing duplicate-refresh guard and late-frame allowance.
 	for ( uint64_t offset : { 0u, 100u, 400u } )
 	for ( uint64_t processed : { 0u, 1000u, 2000u, 2100u, 2500u } )

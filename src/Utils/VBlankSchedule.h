@@ -4,6 +4,14 @@
 
 namespace gamescope
 {
+	constexpr uint64_t NextFrameCallbackTime( uint64_t previous, uint64_t interval,
+		uint64_t now, uint64_t refreshInterval, uint64_t earlyAllowance )
+	{
+		const uint64_t schedule = previous + interval;
+		return now + earlyAllowance >= schedule && now < schedule + refreshInterval
+			? schedule : now;
+	}
+
 	constexpr uint64_t VBlankIndexAdvance( uint64_t previous, uint64_t target, uint64_t interval )
 	{
 		return target > previous ? ( target - previous + interval / 2 ) / interval : 0;
