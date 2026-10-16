@@ -598,6 +598,7 @@ bool vulkan_capture_prefers_readback(void);
 uint32_t vulkan_get_rgb10_capture_format( void );
 
 void vulkan_present_to_window( uint64_t frameGenerationOutputId );
+void vulkan_present_wait_shutdown( void );
 
 void vulkan_garbage_collect( void );
 bool vulkan_remake_swapchain( void );
