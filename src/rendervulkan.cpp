@@ -64,6 +64,8 @@
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
+#include "cs_nis_hdr_linear.h"
+#include "cs_nis_hdr_linear_fp16.h"
 #include "cs_rgb_to_nv12.h"
 #include "cs_sgsr.h"
 
@@ -1181,6 +1183,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(EASU, cs_easu_fp16);
 		SHADER(EASU_RGBA16F, cs_easu_fp16_rgba16f);
 		SHADER(NIS, cs_nis_fp16);
+		SHADER(NIS_HDR_LINEAR, cs_nis_hdr_linear_fp16);
 	}
 	else
 	{
@@ -1188,6 +1191,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(EASU, cs_easu);
 		SHADER(EASU_RGBA16F, cs_easu_rgba16f);
 		SHADER(NIS, cs_nis);
+		SHADER(NIS_HDR_LINEAR, cs_nis_hdr_linear);
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 
@@ -1523,6 +1527,7 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	SHADER(EASU, 1, 1, 1);
 	SHADER(EASU_RGBA16F, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
+	SHADER(NIS_HDR_LINEAR, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
 
 	SHADER(SGSR, 1, 1, 1);
@@ -5225,7 +5230,7 @@ struct NisPushData_t
 {
 	NISConfig nisConfig;
 
-	NisPushData_t(uint32_t inputX, uint32_t inputY, uint32_t tempX, uint32_t tempY, float sharpness)
+	NisPushData_t(uint32_t inputX, uint32_t inputY, uint32_t tempX, uint32_t tempY, float sharpness, NISHDRMode hdrMode)
 	{
 		NVScalerUpdateConfig(
 			nisConfig, sharpness,
@@ -5234,7 +5239,8 @@ struct NisPushData_t
 			inputX, inputY,
 			0, 0,
 			tempX, tempY,
-			tempX, tempY);
+			tempX, tempY,
+			hdrMode);
 	}
 };
 #pragma pack(pop)
@@ -5668,7 +5674,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 		float nisSharpness = (20 - frameInfo->nUpscaleSharpness) / 20.0f;
 
-		cmdBuffer->bindPipeline(g_device.pipeline(SHADER_TYPE_NIS));
+		// The SDR luma ramp bottoms out at 0.9, which is 72 nits in scRGB.
+		const bool bNisLinearHdr = frameInfo->layers.get( 0 ).colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
+
+		cmdBuffer->bindPipeline(g_device.pipeline(bNisLinearHdr ? SHADER_TYPE_NIS_HDR_LINEAR : SHADER_TYPE_NIS));
 		cmdBuffer->bindTarget(g_output.tmpOutput);
 		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
 		cmdBuffer->setTextureSrgb(0, true);
@@ -5680,7 +5689,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->bindTexture(VKR_NIS_COEF_USM_SLOT, g_output.nisUsmImage);
 		cmdBuffer->setSamplerUnnormalized(VKR_NIS_COEF_USM_SLOT, false);
 		cmdBuffer->setSamplerNearest(VKR_NIS_COEF_USM_SLOT, false);
-		cmdBuffer->uploadConstants<NisPushData_t>(inputX, inputY, tempX, tempY, nisSharpness);
+		// NISHDRMode{} is None, which X11's None macro hides.
+		cmdBuffer->uploadConstants<NisPushData_t>(inputX, inputY, tempX, tempY, nisSharpness, bNisLinearHdr ? NISHDRMode::Linear : NISHDRMode{});
 
 		int pixelsPerGroupX = 32;
 		int pixelsPerGroupY = 24;
