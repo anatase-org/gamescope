@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <sys/msg.h>
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -16,6 +17,7 @@
 
 static bool inited = false;
 static int msgid = 0;
+std::atomic<uint32_t> g_uScanoutRefreshmHz = 0;
 static std::mutex s_SnapshotMutex;
 static std::unordered_map<uint32_t, MangoappSnapshot_t> s_ConnectorSnapshots;
 extern bool g_bAppWantsHDRCached;
@@ -45,6 +47,7 @@ struct mangoapp_msg_v1 {
     uint8_t frameGenerationEnabled;
     uint8_t upscaler; // GamescopeUpscaleFilter that produced the frame, LINEAR when none did
     uint8_t wantedUpscaler; // GamescopeUpscaleFilter the user selected
+    uint32_t scanoutRefreshmHz; // refreshes the panel actually scanned out, follows VRR, 0 when unknown
 
     // WARNING: Always ADD fields, never remove or repurpose fields
 } __attribute__((packed));
@@ -234,6 +237,7 @@ static void mangoapp_send_update( uint64_t visible_frametime, uint64_t app_frame
     msg.outputWidth = snapshot.uOutputWidth;
     msg.outputHeight = snapshot.uOutputHeight;
     msg.displayRefresh = (uint16_t) gamescope::ConvertmHzToHz( snapshot.nOutputRefreshmHz );
+    msg.scanoutRefreshmHz = g_uScanoutRefreshmHz;
     msg.bAppWantsHDR = snapshot.bAppWantsHDR;
     msg.bSteamFocused = snapshot.bSteamFocused;
     if (snapshot.pEngineName)
