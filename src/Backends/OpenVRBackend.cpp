@@ -1271,6 +1271,7 @@ namespace gamescope
                                         wlserver_touchdown(flX, flY, 0, ++m_uFakeTimestamp);
                                     else
                                         wlserver_touchup(0, ++m_uFakeTimestamp);
+                                    wlserver_touchframe();
                                 }
                                 else if (vrEvent.data.mouse.button == vr::VRMouseButton_Right)
                                 {
@@ -1344,6 +1345,7 @@ namespace gamescope
 
                 wlserver_lock();
                 wlserver_touchmotion(flTouchMoveX, flTouchMoveY, 0, ++m_uFakeTimestamp, bAlwaysMoveCursor);
+                wlserver_touchframe();
                 wlserver_unlock();
             }
 

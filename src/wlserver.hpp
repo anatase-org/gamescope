@@ -222,6 +222,8 @@ struct wlserver_touch {
 	struct wl_listener down;
 	struct wl_listener up;
 	struct wl_listener motion;
+	struct wl_listener frame;
+	struct wl_listener destroy;
 
     gamescope::IBackendConnector* connector;
 };
@@ -256,6 +258,7 @@ void wlserver_mousewheel( double x, double y, uint32_t time );
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor = false, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchdown( double x, double y, int touch_id, uint32_t time, gamescope::IBackendConnector* connector = nullptr );
 void wlserver_touchup( int touch_id, uint32_t time );
+void wlserver_touchframe();
 
 void wlserver_send_frame_done( struct wlr_surface *surf, const struct timespec *when );
 
