@@ -4736,6 +4736,31 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	{
 
 
+		if (g_uCompositeDebug == 0)
+		{
+			int retained = 0;
+			for (int i = 0; i < sampledFrame.layerCount; ++i)
+			{
+				auto &layer = sampledFrame.layers[i];
+				if (i > 0 && layer.opacity == 0.0f && layer.eAlphaBlendingMode != ALPHA_BLENDING_MODE_NONE)
+					continue;
+				const auto offset = layer.offsetPixelCenter();
+				const float x1 = offset.x * layer.scale.x, y1 = offset.y * layer.scale.y;
+				const float x2 = (currentOutputWidth - 1 + offset.x) * layer.scale.x;
+				const float y2 = (currentOutputHeight - 1 + offset.y) * layer.scale.y;
+				const bool coversOutput = layer.blackBorder ||
+					(std::min(x1, x2) >= 0 && std::min(y1, y2) >= 0 &&
+					 std::max(x1, x2) < layer.tex->width() && std::max(y1, y2) < layer.tex->height());
+				// NONE replaces every output pixel, including transparent borders.
+				if (i > 0 && (layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_NONE ||
+					(layer.opacity == 1.0f && !layer.hasAlpha() && coversOutput)))
+					retained = 0;
+				if (retained != i)
+					sampledFrame.layers[retained] = std::move(layer);
+				++retained;
+			}
+			sampledFrame.layerCount = retained;
+		}
 		for (int i = 0; i < sampledFrame.layerCount; ++i)
 		{
 			auto &layer = sampledFrame.layers[i];
