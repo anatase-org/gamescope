@@ -4545,7 +4545,7 @@ struct NisPushData_t
 };
 #pragma pack(pop)
 
-void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *frameInfo)
+void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *frameInfo, uint32_t encodedInputMask = 0)
 {
 	for ( int i = 0; i < frameInfo->layerCount; i++ )
 	{
@@ -4556,7 +4556,7 @@ void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *fram
                     || (layer->filter == GamescopeUpscaleFilter::LINEAR && !layer->viewConvertsToLinearAutomatically());
 
 		cmdBuffer->bindTexture(i, layer->tex);
-		cmdBuffer->setTextureSrgb(i, layer->colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR);
+		cmdBuffer->setTextureSrgb(i, (encodedInputMask & (1u << i)) || layer->colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR);
 		cmdBuffer->setSamplerNearest(i, nearest);
 		cmdBuffer->setSamplerUnnormalized(i, true);
 	}
@@ -5013,13 +5013,25 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 		} else {
 			CompositeShaderConfig_t compositeConfig;
-			compositeConfig.filterMask = compositeConfig.colorMgmtMask = 0;
+			compositeConfig.filterMask = compositeConfig.colorMgmtMask = compositeConfig.samplingMask = 0;
 			for (int i = 0; i < frameInfo->layerCount; ++i)
 			{
 				const auto &layer = frameInfo->layers[i];
 				compositeConfig.filterMask |= uint32_t(layer.shaderFilter()) << (i * 4);
 				if (layer.ctm)
 					compositeConfig.colorMgmtMask |= 1u << i;
+				const bool aligned = !layer.isYcbcr() && layer.scale.x == 1.0f && layer.scale.y == 1.0f &&
+					float_is_integer(layer.offset.x) && float_is_integer(layer.offset.y);
+				if (aligned)
+					compositeConfig.samplingMask |= 1u << (i + k_nMaxLayers);
+				if (aligned && !layer.ctm && layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR &&
+					frameInfo->shaperLut[EOTF_Gamma22] && ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format())
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 3 * EOTF_Count + i);
+				if (layer.blackBorder)
+					compositeConfig.samplingMask |= 1u << (i + 2 * k_nMaxLayers);
+				if (aligned && layer.offset.x == 0.0f && layer.offset.y == 0.0f &&
+					layer.tex->width() >= currentOutputWidth && layer.tex->height() >= currentOutputHeight)
+					compositeConfig.samplingMask |= 1u << i;
 			}
 			for (uint32_t i = 0; i < EOTF_Count; ++i)
 			{
@@ -5036,7 +5048,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			}
 			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,
 				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, false, compositeConfig));
-			bind_all_layers(cmdBuffer.get(), frameInfo);
+			bind_all_layers(cmdBuffer.get(), frameInfo, compositeConfig.colorMgmtMask >> (k_nMaxLayers + 3 * EOTF_Count));
 			cmdBuffer->bindTarget(compositeImage);
 			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
 
