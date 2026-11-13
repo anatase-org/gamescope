@@ -86,8 +86,15 @@ add_project_arguments(
 )
 
 if hwdata_dep.found()
+  hwdata_dir = hwdata_dep.get_variable('pkgdatadir')
+  if meson.is_cross_build()
+    sys_root = meson.get_external_property('sys_root', '')
+    if sys_root != '' and hwdata_dir.startswith(sys_root + '/')
+      hwdata_dir = hwdata_dir.replace(sys_root, '')
+    endif
+  endif
   add_project_arguments(
-  '-DHWDATA_PNP_IDS="@0@"'.format(hwdata_dep.get_variable('pkgdatadir') / 'pnp.ids'),
+  '-DHWDATA_PNP_IDS="@0@"'.format(hwdata_dir / 'pnp.ids'),
   language: 'cpp',
   )
 else
