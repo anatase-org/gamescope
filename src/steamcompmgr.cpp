@@ -8837,6 +8837,8 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
+		// Retire completed GPU reads promptly so clients can reuse their buffers.
+		g_device.garbageCollect();
 
 		static uint64_t s_lastFrameGenerationConfigSerial = 0;
 		const uint64_t frameGenerationConfigSerial =

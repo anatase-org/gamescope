@@ -1887,19 +1887,13 @@ void CVulkanDevice::waitIdle(bool reset)
 
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
-	auto last = m_pendingCmdBufs.find(sequence);
-	if (last == m_pendingCmdBufs.end())
-		return;
-
-	for (auto it = m_pendingCmdBufs.begin(); ; it++)
+	auto end = m_pendingCmdBufs.upper_bound(sequence);
+	for (auto it = m_pendingCmdBufs.begin(); it != end; ++it)
 	{
 		it->second->reset();
 		m_unusedCmdBufs.push_back(std::move(it->second));
-		if (it == last)
-			break;
 	}
-
-	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), ++last);
+	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), end);
 }
 
 CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily)

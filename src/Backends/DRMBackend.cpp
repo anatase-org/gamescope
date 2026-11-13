@@ -2971,6 +2971,11 @@ void drm_rollback( struct drm_t *drm )
  * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
 {
+	// Keep one KMS flip in flight, while processing clients between submissions.
+	uint32_t pending = drm->uPendingFlipCount.load();
+	if (pending)
+		drm->uPendingFlipCount.wait(pending);
+
 	if ( !drm->pConnector )
 		return -EACCES;
 
@@ -4326,11 +4331,10 @@ namespace gamescope
 			defer( if ( drm->req != nullptr ) { drmModeAtomicFree( drm->req ); drm->req = nullptr; } );
 
 			bool isPageFlip = drm->flags & DRM_MODE_PAGE_FLIP_EVENT;
-			uint32_t uNewPendingFlipCount = 0;
 
 			if ( isPageFlip )
 			{
-				uNewPendingFlipCount = ++drm->uPendingFlipCount;
+				++drm->uPendingFlipCount;
 
 				// Do it before the commit, as otherwise the pageflip handler could
 				// potentially beat us to the refcount checks.
@@ -4425,14 +4429,6 @@ namespace gamescope
 			// not when it is successfully queued.
 			if (!m_bAsyncCompositeTiming)
 				GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
-
-
-			if ( isPageFlip )
-			{
-				// Wait for bPendingFlip to change from true -> false.
-				drm->uPendingFlipCount.wait( uNewPendingFlipCount );
-				assert( drm->uPendingFlipCount == 0 );
-			}
 
 
 			return ret;
