@@ -4508,8 +4508,8 @@ void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *fram
 std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
-	if (!frameInfo->applyOutputColorMgmt)
-		outputTF = EOTF_Count; //Disable blending stuff.
+	if (frameInfo->blendInDisplayEncoding)
+		outputTF = EOTF_Count; // Mura correction blends encoded values.
 
 	auto cmdBuffer = g_device.commandBuffer();
 
@@ -4611,7 +4611,7 @@ static ShaderType blit_shader_for_target( const CVulkanTexture *texture )
 static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanTexture *output, EOTF outputTF )
 {
 	if ( frameInfo->layerCount != 1 ||
-	     !frameInfo->applyOutputColorMgmt ||
+	     frameInfo->blendInDisplayEncoding ||
 	     outputTF != EOTF_Gamma22 ||
 	     g_bHDRItmEnable ||
 	     g_uCompositeDebug != 0 ||
@@ -4647,7 +4647,7 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 {
 	if ( cv_fsr_rcas_fp16 == 0 ||
 	     !g_device.supportsFp16() ||
-	     !frameInfo->applyOutputColorMgmt ||
+	     frameInfo->blendInDisplayEncoding ||
 	     outputTF != EOTF_Gamma22 ||
 	     g_bHDRItmEnable ||
 	     !is_8bit_sdr_target( output ) )
@@ -4673,8 +4673,8 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool applyRotation, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
-	if (!frameInfo->applyOutputColorMgmt)
-		outputTF = EOTF_Count; //Disable blending stuff.
+	if (frameInfo->blendInDisplayEncoding)
+		outputTF = EOTF_Count; // Mura correction blends encoded values.
 
 	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())

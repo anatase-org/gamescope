@@ -2978,6 +2978,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 
 		// Blending needs to be done in Gamma 2.2 space for mura correction to work.
 		frameInfo.applyOutputColorMgmt = false;
+		frameInfo.blendInDisplayEncoding = true;
 	}
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
@@ -3078,6 +3079,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 
 				// Re-enable output color management (blending) if it was disabled by mura.
 				screenshotFrameInfo.applyOutputColorMgmt = true;
+				screenshotFrameInfo.blendInDisplayEncoding = false;
 			}
 
 			screenshotFrameInfo.outputEncodingEOTF = bHDRScreenshot ? EOTF_PQ : EOTF_Gamma22;

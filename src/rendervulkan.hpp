@@ -320,6 +320,7 @@ struct FrameInfo_t
 	bool frameGenerationActive = false;
 	uint64_t frameGenerationOutputId = 0;
 	bool applyOutputColorMgmt; // drm only
+	bool blendInDisplayEncoding = false; // Mura correction operates on encoded values.
 	EOTF outputEncodingEOTF;
 
 	bool dpms;
