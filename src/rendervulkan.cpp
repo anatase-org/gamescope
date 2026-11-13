@@ -1234,8 +1234,8 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.output_eotf = output_eotf,
 		.fsr_simple_output = fsr_simple_output,
 		.itm_enable = itm_enable,
-		.workgroup_x = 8u,
-		.workgroup_y = 8u,
+		.workgroup_x = fsr_simple_output && isV3dv() ? 256u : 8u,
+		.workgroup_y = fsr_simple_output && isV3dv() ? 1u : 8u,
 		.simple_blend = simple_blend,
 		.filter_mask = composite_config.filterMask,
 		.color_mgmt_mask = composite_config.colorMgmtMask,
@@ -4695,13 +4695,11 @@ static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanText
 	     layer.colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB )
 		return false;
 
-	for ( uint32_t i = 0; i < EOTF_Count; i++ )
-	{
-		if ( frameInfo->shaperLut[i] || frameInfo->lut3D[i] )
-			return false;
-	}
-
-	return true;
+	// RCAS writes encoded SDR into a bounded UNORM target. With one opaque
+	// layer, an identity SDR LUT adds no clamping or blending that changes it.
+	return (!frameInfo->shaperLut[EOTF_Gamma22] && !frameInfo->lut3D[EOTF_Gamma22]) ||
+		(frameInfo->shaperLut[EOTF_Gamma22] && frameInfo->lut3D[EOTF_Gamma22] &&
+		 frameInfo->shaperLut[EOTF_Gamma22]->identityLut && frameInfo->lut3D[EOTF_Gamma22]->identityLut);
 }
 
 static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTexture *output, EOTF outputTF )
