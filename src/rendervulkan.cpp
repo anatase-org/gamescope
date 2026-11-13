@@ -5013,6 +5013,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 		} else {
 			CompositeShaderConfig_t compositeConfig;
+			compositeConfig.opaqueOutput = !DRMFormatHasAlpha(compositeImage->drmFormat());
 			compositeConfig.filterMask = compositeConfig.colorMgmtMask = compositeConfig.samplingMask = 0;
 			for (int i = 0; i < frameInfo->layerCount; ++i)
 			{
@@ -5046,8 +5047,11 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				else
 					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
 			}
+			const bool simpleBlend = frameInfo->layerCount > 0 && frameInfo->layers[0].opacity == 1.0f &&
+				std::all_of(frameInfo->layers + 1, frameInfo->layers + frameInfo->layerCount,
+					[](const auto &layer) { return layer.opacity == 1.0f && layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
 			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,
-				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, false, compositeConfig));
+				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, simpleBlend, compositeConfig));
 			bind_all_layers(cmdBuffer.get(), frameInfo, compositeConfig.colorMgmtMask >> (k_nMaxLayers + 3 * EOTF_Count));
 			cmdBuffer->bindTarget(compositeImage);
 			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
