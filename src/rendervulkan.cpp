@@ -2025,11 +2025,28 @@ static VkRect2D raster_layer_bounds(const FrameInfo_t::Layer_t &layer, uint32_t 
 	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
 }
 
-void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config)
+void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase)
 {
-	for (auto *src : m_boundTextures)
-		if (src)
-			prepareSrcImage(src);
+	VkRect2D renderArea = {{0, 0}, {m_target->width(), m_target->height()}};
+	if (copyBase)
+	{
+		copyImage(frame->layers[0].tex, m_target);
+		renderArea = {};
+		for (int i = 1; i < frame->layerCount; ++i)
+		{
+			auto box = raster_layer_bounds(frame->layers[i], m_target->width(), m_target->height());
+			if (!box.extent.width || !box.extent.height) continue;
+			if (!renderArea.extent.width || !renderArea.extent.height) { renderArea = box; continue; }
+			int left = std::min(renderArea.offset.x, box.offset.x), top = std::min(renderArea.offset.y, box.offset.y);
+			int right = std::max(renderArea.offset.x + int(renderArea.extent.width), box.offset.x + int(box.extent.width));
+			int bottom = std::max(renderArea.offset.y + int(renderArea.extent.height), box.offset.y + int(box.extent.height));
+			renderArea = {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+		}
+		if (!renderArea.extent.width || !renderArea.extent.height) return;
+	}
+	for (uint32_t i = copyBase ? 1 : 0; i < m_boundTextures.size(); ++i)
+		if (m_boundTextures[i])
+			prepareSrcImage(m_boundTextures[i]);
 	prepareDestImage(m_target);
 	insertBarrier();
 	bindDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -2037,18 +2054,18 @@ void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, Co
 		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
 		.imageView = outputTF == EOTF_Gamma22 ? m_target->linearView() : m_target->srgbView(),
 		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.loadOp = copyBase ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	};
 	VkRenderingInfo rendering = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-		.renderArea = {{0, 0}, {m_target->width(), m_target->height()}}, .layerCount = 1,
+		.renderArea = renderArea, .layerCount = 1,
 		.colorAttachmentCount = 1, .pColorAttachments = &attachment,
 	};
 	m_device->vk.CmdBeginRendering(m_cmdBuffer, &rendering);
 	VkViewport viewport = {0.0f, 0.0f, float(m_target->width()), float(m_target->height()), 0.0f, 1.0f};
 	m_device->vk.CmdSetViewport(m_cmdBuffer, 0, 1, &viewport);
 	config.renderFormat = outputTF == EOTF_Gamma22 ? ToSrgbVulkanFormat(m_target->format()) : m_target->format();
-	for (int i = 0; i < frame->layerCount; ++i)
+	for (int i = copyBase ? 1 : 0; i < frame->layerCount; ++i)
 	{
 		VkRect2D scissor = raster_layer_bounds(frame->layers[i], m_target->width(), m_target->height());
 		if (!scissor.extent.width || !scissor.extent.height)
@@ -2068,6 +2085,12 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 {
 	assert(src->width() == dst->width());
 	assert(src->height() == dst->height());
+	if (src->linearSource && src->linearSourceDirty)
+	{
+		src->ReferenceReleasePoints(m_releasePointRefs);
+		m_textureRefs.emplace_back(src);
+		src = src->linearSource;
+	}
 	prepareSrcImage(src.get());
 	prepareDestImage(dst.get());
 	insertBarrier();
@@ -2425,6 +2448,8 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	{
 		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	}
+
+	m_usage = usage;
 
 	if ( flags.bMappable == true )
 	{
@@ -2903,7 +2928,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 	}
 
-	bool bHasAlpha = ( pDMA && !flags.bOutputImage ) ? DRMFormatHasAlpha( pDMA->format ) : true;
+	bool bHasAlpha = !flags.bOutputImage && !flags.bStorage ? DRMFormatHasAlpha(drmFormat) : true;
 
 	if (!bHasAlpha )
 	{
@@ -4962,13 +4987,26 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
 		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
+	const auto &base = frameInfo->layers[0];
+	const auto *copySource = base.tex && base.tex->linearSource && base.tex->linearSourceDirty ? base.tex->linearSource.get() : base.tex.get();
+	const bool canCopyBase = frameInfo->layerCount > 0 && copySource && !partial && !pOutputOverride && !pPipewireTexture &&
+		!GetBackend()->UsesVulkanSwapchain() && !applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 &&
+		!frameInfo->blurLayer0 && !frameInfo->frameGenerationActive && !g_bHDRItmEnable && !g_pLastReshadeEffect && g_uCompositeDebug == 0 &&
+		outputTF == EOTF_Gamma22 && (base.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR || base.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB) &&
+		!base.ctm && !frameInfo->shaperLut[EOTF_Gamma22] && base.opacity == 1.0f &&
+		base.scale.x == 1.0f && base.scale.y == 1.0f && base.offset.x == 0.0f && base.offset.y == 0.0f &&
+		base.tex->width() == scanout->width() && base.tex->height() == scanout->height() &&
+		copySource->format() == scanout->format() && (copySource->usage() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+		(scanout->usage() & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+		(!DRMFormatHasAlpha(scanout->drmFormat()) || DRMFormatHasAlpha(copySource->drmFormat()));
+	const bool copyOnly = canCopyBase && frameInfo->layerCount == 1;
 	const bool raster = frameInfo->layerCount > 0 && scanout->colorAttachment() && g_device.queueFamily() == g_device.generalQueueFamily() &&
 		!applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 &&
 		!pPipewireTexture && !g_bHDRItmEnable && g_uCompositeDebug == 0 &&
 		(outputTF == EOTF_Count || (outputTF == EOTF_Gamma22 && ToSrgbVulkanFormat(scanout->format()) != scanout->format())) &&
 		std::all_of(frameInfo->layers + 1, frameInfo->layers + frameInfo->layerCount,
 			[](const auto &layer) { return layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
-	if ( !raster && !pOutputOverride && !scanout->storageImage() && !g_output.compositionScratch )
+	if ( !copyOnly && !raster && !pOutputOverride && !scanout->storageImage() && !g_output.compositionScratch )
 	{
 		CVulkanTexture::createFlags flags;
 		flags.bStorage = flags.bSampled = flags.bTransferSrc = flags.bTransferDst = true;
@@ -4979,15 +5017,18 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			return std::nullopt;
 		}
 	}
-	gamescope::Rc<CVulkanTexture> compositeImage = !raster && !pOutputOverride && g_output.compositionScratch
+	gamescope::Rc<CVulkanTexture> compositeImage = !copyOnly && !raster && !pOutputOverride && g_output.compositionScratch
 		? g_output.compositionScratch.get() : scanout.get();
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 
-	for (uint32_t i = 0; i < EOTF_Count; i++)
-		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
+	if (!copyOnly)
+		for (uint32_t i = 0; i < EOTF_Count; i++)
+			cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
 
-	if ( frameInfo->useFSRLayer0 )
+	if (copyOnly)
+		cmdBuffer->copyImage(base.tex, scanout);
+	else if ( frameInfo->useFSRLayer0 )
 	{
 		uint32_t inputX = frameInfo->layers[0].tex->width();
 		uint32_t inputY = frameInfo->layers[0].tex->height();
@@ -5207,7 +5248,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
 
 			if (raster)
-				cmdBuffer->drawComposite(frameInfo, outputTF, compositeConfig);
+				cmdBuffer->drawComposite(frameInfo, outputTF, compositeConfig, canCopyBase);
 			else
 			{
 			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,

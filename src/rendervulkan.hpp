@@ -190,6 +190,7 @@ public:
 	inline bool outputImage() { return m_bOutputImage; }
 	inline bool colorAttachment() const { return m_bColorAttachment; }
 	inline bool storageImage() const { return m_bStorage; }
+	inline VkImageUsageFlags usage() const { return m_usage; }
 	inline bool externalImage() { return m_bExternal; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
@@ -230,6 +231,7 @@ private:
 	bool m_bOutputImage = false;
 	bool m_bColorAttachment = false;
 	bool m_bStorage = false;
+	VkImageUsageFlags m_usage = 0;
 	bool m_bOwnsImage = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
@@ -1114,7 +1116,7 @@ public:
 	void bindPipeline(VkPipeline pipeline);
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
 	void bindDescriptors(VkPipelineBindPoint bindPoint);
-	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config);
+	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
