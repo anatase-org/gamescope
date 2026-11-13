@@ -1596,6 +1596,12 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 
 	pSignalSemaphores.push_back( m_scratchTimelineSemaphore );
 	ulSignalPoints.push_back( nextSeqNo );
+	if (cmdBuffer->m_signalCompletion)
+	{
+		pSignalSemaphores.push_back(cmdBuffer->m_completionSemaphore);
+		ulSignalPoints.push_back(0); // Binary semaphore; timeline value is ignored.
+	}
+
 
 	for ( auto &dep : cmdBuffer->GetExternalSignals() )
 	{
@@ -1639,9 +1645,38 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	return nextSeqNo;
 }
 
-uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
+uint64_t CVulkanDevice::submit(std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, bool completionFence)
 {
+	if (completionFence && !cmdBuffer->m_completionSemaphore)
+	{
+		VkExportSemaphoreCreateInfo external = {
+			.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+			.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
+		VkSemaphoreCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &external };
+		if (vk.CreateSemaphore(device(), &info, nullptr, &cmdBuffer->m_completionSemaphore) != VK_SUCCESS)
+			vk_log.warnf("Completion sync-file semaphore unavailable; using CPU synchronization");
+	}
+	cmdBuffer->m_signalCompletion = completionFence && cmdBuffer->m_completionSemaphore;
 	uint64_t nextSeqNo = submitInternal(cmdBuffer.get());
+	if (cmdBuffer->m_signalCompletion)
+	{
+		VkSemaphoreGetFdInfoKHR info = {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+			.semaphore = cmdBuffer->m_completionSemaphore,
+			.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
+		int fd = -1;
+		VkResult res = vk.GetSemaphoreFdKHR(device(), &info, &fd);
+		if (res == VK_SUCCESS)
+			cmdBuffer->m_completionFd = fd; // -1 is a valid, already-signaled sync file.
+		else
+		{
+			vk_errorf(res, "Failed to export composition completion fence");
+			cmdBuffer->m_completionFd.reset();
+			cmdBuffer->m_completionExportFailed = true;
+		}
+	}
 	m_pendingCmdBufs.emplace(nextSeqNo, std::move(cmdBuffer));
 	return nextSeqNo;
 }
@@ -1678,6 +1713,12 @@ void CVulkanDevice::garbageCollect( void )
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 
 	resetCmdBuffers(currentSeqNo);
+}
+
+std::optional<int> CVulkanDevice::takeCompletionFence(uint64_t sequence)
+{
+	auto it = m_pendingCmdBufs.find(sequence);
+	return it == m_pendingCmdBufs.end() ? std::nullopt : std::exchange(it->second->m_completionFd, std::nullopt);
 }
 
 VulkanTimelineSemaphore_t::~VulkanTimelineSemaphore_t()
@@ -1868,12 +1909,26 @@ CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuf
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
 {
+	if (m_completionFd && *m_completionFd >= 0)
+		close(*m_completionFd);
+	if (m_completionSemaphore)
+		m_device->vk.DestroySemaphore(m_device->device(), m_completionSemaphore, nullptr);
 	m_device->recycleDescriptorSets( m_descriptorSets );
 	m_device->vk.FreeCommandBuffers(m_device->device(), m_device->commandPool(), 1, &m_cmdBuffer);
 }
 
 void CVulkanCmdBuffer::reset()
 {
+	if (m_completionFd && *m_completionFd >= 0)
+		close(*m_completionFd);
+	if (m_completionExportFailed)
+	{
+		m_device->vk.DestroySemaphore(m_device->device(), m_completionSemaphore, nullptr);
+		m_completionSemaphore = VK_NULL_HANDLE;
+		m_completionExportFailed = false;
+	}
+	m_completionFd.reset();
+	m_signalCompletion = false;
 	vk_check( m_device->vk.ResetCommandBuffer(m_cmdBuffer, 0) );
 	m_device->recycleDescriptorSets( m_descriptorSets );
 	m_textureRefs.clear();
@@ -5716,7 +5771,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	if ( compositeImage != scanout )
 		cmdBuffer->copyImage(compositeImage, scanout);
 
-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+	uint64_t sequence = g_device.submit(std::move(cmdBuffer), !GetBackend()->UsesVulkanSwapchain() && !pOutputOverride);
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{

@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #include <atomic>
 #include <cassert>
@@ -573,6 +575,53 @@ struct DRMPresentCtx
 	uint64_t ulPendingFlipCount = 0;
 	uint64_t frameGenerationOutputId = 0;
 };
+
+// Fence completion feeds the actual rendering latency back into frame scheduling.
+// Reporting only CPU submission time after removing vulkan_wait would wake too late.
+class CCompositeCompletion final : public gamescope::IWaitable, public gamescope::RcObject
+{
+public:
+	CCompositeCompletion(int fd, uint64_t start) : m_fd(fd), m_start(start) {}
+	~CCompositeCompletion() { close(m_fd); }
+	int GetFD() override { return m_fd; }
+	void OnPollIn() override;
+private:
+	int m_fd;
+	uint64_t m_start;
+};
+
+static gamescope::CAsyncWaiter<gamescope::Rc<CCompositeCompletion>> &composite_waiter()
+{
+	static gamescope::CAsyncWaiter<gamescope::Rc<CCompositeCompletion>> waiter("gamescope_comp");
+	return waiter;
+}
+
+void CCompositeCompletion::OnPollIn()
+{
+	GetVBlankTimer().UpdateLastDrawTime(get_time_in_nanos() - m_start);
+	composite_waiter().RemoveWaitable(this);
+	nudge_steamcompmgr();
+}
+
+static bool watch_composite(int fd, uint64_t start)
+{
+	if (fd < 0)
+	{
+		GetVBlankTimer().UpdateLastDrawTime(get_time_in_nanos() - start);
+		return true;
+	}
+	int copy = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+	if (copy < 0)
+		return false;
+	gamescope::OwningRc<CCompositeCompletion> completion = new CCompositeCompletion(copy, start);
+	return composite_waiter().AddWaitable(completion.get());
+}
+
+static void wait_sync_file(int fd)
+{
+	pollfd p = { .fd = fd, .events = POLLIN };
+	while (poll(&p, 1, -1) < 0 && errno == EINTR) {}
+}
 
 extern gamescope::ConVar<bool> cv_composite_force;
 extern bool g_bColorSliderInUse;
@@ -2649,11 +2698,18 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			}
 
 			int nFence = -1;
-			if ( !cv_drm_debug_disable_in_fence_fd && pLayer->acquirePoint )
+			if (!cv_drm_debug_disable_in_fence_fd)
 			{
-				nFence = pLayer->acquirePoint->CreateSyncFile();
-				if ( nFence >= 0 )
-					drm->m_InFenceFdsInRequest.push_back( nFence );
+				if (pLayer->acquireFenceFd >= 0)
+					nFence = fcntl(pLayer->acquireFenceFd, F_DUPFD_CLOEXEC, 0);
+				else if (pLayer->acquirePoint)
+					nFence = pLayer->acquirePoint->CreateSyncFile();
+				if (nFence >= 0)
+					drm->m_InFenceFdsInRequest.push_back(nFence);
+				else if (pLayer->acquireFenceFd >= 0)
+					wait_sync_file(pLayer->acquireFenceFd);
+				else if (pLayer->acquirePoint)
+					pLayer->acquirePoint->Wait();
 			}
 
 
@@ -2836,6 +2892,10 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 		attempted_in_fence_fallback = true;
 		for ( int i = 0; i < frameInfo->layerCount; i++ )
 		{
+			if ( frameInfo->layers[i].acquirePoint )
+				frameInfo->layers[i].acquirePoint->Wait();
+			if (frameInfo->layers[i].acquireFenceFd >= 0)
+				wait_sync_file(frameInfo->layers[i].acquireFenceFd);
 			liftoff_layer_set_property( drm->lo_layers[ i ], "IN_FENCE_FD", -1 );
 		}
 
@@ -3622,6 +3682,7 @@ namespace gamescope
 
 		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync )
 		{
+			m_bAsyncCompositeTiming = false;
 			const FrameInfo_t *pUnprocessedFrameInfo = pFrameInfo;
 			static uint64_t s_ulLastTime = get_time_in_nanos();
 			uint64_t ulNow = get_time_in_nanos();
@@ -3711,7 +3772,7 @@ namespace gamescope
 
 			bool bNeedsFullComposite = false;
 			bNeedsFullComposite |= cv_composite_force;
-			// NVIDIA client DMA-BUFs have no physical-contiguity guarantee.
+			// These backends require scanout buffers allocated on the KMS device.
 			bNeedsFullComposite |= bForceBackendComposition;
 			bNeedsFullComposite |= bWasFirstFrame;
 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
@@ -3863,7 +3924,29 @@ namespace gamescope
 				return -EINVAL;
 			}
 
-			vulkan_wait( *oCompositeResult, true );
+			auto completion = g_device.takeCompletionFence(*oCompositeResult);
+			const int completionFd = completion.value_or(-1);
+			defer(if (completionFd >= 0) close(completionFd));
+			const bool explicitFence = !cv_drm_debug_disable_in_fence_fd && g_DRM.pPrimaryPlane->GetProperties().IN_FENCE_FD;
+			if (completion && completionFd >= 0 && !explicitFence)
+			{
+				auto image = vulkan_get_last_output_image(false, false);
+				dma_buf_import_sync_file fence = { .flags = DMA_BUF_SYNC_WRITE, .fd = completionFd };
+				if (ioctl(image->dmabuf().fd[0], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &fence) != 0)
+				{
+					static bool warned = false;
+					if (!std::exchange(warned, true))
+						drm_log.errorf_errno("Failed to attach compositor completion fence to DMA-BUF");
+					completion.reset();
+				}
+			}
+			if (completion)
+				m_bAsyncCompositeTiming = watch_composite(completionFd, g_SteamCompMgrVBlankTime.ulWakeupTime);
+			if (!m_bAsyncCompositeTiming)
+				vulkan_wait(*oCompositeResult, true);
+			static bool loggedFencePath = false;
+			if (!std::exchange(loggedFencePath, true))
+				drm_log.infof("Compositor completion: %s", m_bAsyncCompositeTiming ? (explicitFence ? "IN_FENCE_FD" : "DMA-BUF fence") : "CPU wait");
 
 			FrameInfo_t presentCompFrameInfo = {};
 			presentCompFrameInfo.allowVRR = pFrameInfo->allowVRR;
@@ -3882,6 +3965,7 @@ namespace gamescope
 				baseLayer->zpos = g_zposBase;
 
 				baseLayer->tex = vulkan_get_last_output_image( false, false );
+				baseLayer->acquireFenceFd = explicitFence && m_bAsyncCompositeTiming ? completionFd : -1;
 				baseLayer->applyColorMgmt = false;
 
 				baseLayer->filter = GamescopeUpscaleFilter::NEAREST;
@@ -3907,6 +3991,7 @@ namespace gamescope
 					overlayLayer->zpos = g_zposOverlay;
 
 					overlayLayer->tex = vulkan_get_last_output_image( true, bDefer );
+					overlayLayer->acquireFenceFd = explicitFence && m_bAsyncCompositeTiming ? completionFd : -1;
 					overlayLayer->applyColorMgmt = g_ColorMgmt.pending.enabled;
 
 					overlayLayer->filter = GamescopeUpscaleFilter::NEAREST;
@@ -3947,6 +4032,7 @@ namespace gamescope
 
 				m_bWasPartialCompositing = true;
 			}
+
 
 			int ret = drm_prepare( &g_DRM, bAsync, &presentCompFrameInfo );
 
@@ -4051,7 +4137,7 @@ namespace gamescope
 				GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT );
 			if ( !pBo )
 			{
-				drm_log.errorf_errno( "Failed to allocate NVIDIA GBM scanout buffer" );
+				drm_log.errorf_errno( "Failed to allocate GBM scanout buffer" );
 				return false;
 			}
 
@@ -4071,7 +4157,7 @@ namespace gamescope
 				const int nFd = gbm_bo_get_fd_for_plane( pBo, i );
 				if ( nFd < 0 )
 				{
-					drm_log.errorf_errno( "Failed to export NVIDIA GBM scanout buffer" );
+					drm_log.errorf_errno( "Failed to export GBM scanout buffer" );
 					bSuccess = false;
 					break;
 				}
@@ -4213,6 +4299,7 @@ namespace gamescope
 
 	private:
 		bool m_bWasCompositing = false;
+		bool m_bAsyncCompositeTiming = false;
 		bool m_bWasPartialCompositing = false;
 		int m_nLastSingleOverlayZPos = 0;
 
@@ -4336,7 +4423,9 @@ namespace gamescope
 			// is queued and would end up being the new page flip, rather than here.
 			// However, the page flip handler is called when the page flip occurs,
 			// not when it is successfully queued.
-			GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
+			if (!m_bAsyncCompositeTiming)
+				GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
+
 
 			if ( isPageFlip )
 			{
@@ -4344,6 +4433,7 @@ namespace gamescope
 				drm->uPendingFlipCount.wait( uNewPendingFlipCount );
 				assert( drm->uPendingFlipCount == 0 );
 			}
+
 
 			return ret;
 		}

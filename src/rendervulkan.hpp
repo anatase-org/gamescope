@@ -228,8 +228,8 @@ public:
 	uint64_t textureID = 0;
 	std::atomic<uint64_t> contentVersion = {0};
 	std::unique_ptr<CompositeState_t> compositeState;
-	std::vector<uint16_t> uploadedLut;
 	bool identityLut = false;
+	std::vector<uint16_t> uploadedLut;
 	gamescope::Rc<CVulkanTexture> predecodedLut;
 	bool blackPreservingLut = false;
 
@@ -365,6 +365,8 @@ struct FrameInfo_t
 		std::shared_ptr<gamescope::BackendBlob> ctm;
 		std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
 		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
+		// Borrowed for the duration of a backend Present call.
+		int acquireFenceFd = -1;
 
 		GamescopeAppTextureColorspace colorspace;
 
@@ -951,10 +953,11 @@ public:
 	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false, bool simple_blend = false, CompositeShaderConfig_t composite_config = {});
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
 	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
-	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
+	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, bool completionFence = false);
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
 	bool isComplete(uint64_t sequence);
+	std::optional<int> takeCompletionFence(uint64_t sequence);
 	void waitIdle(bool reset = true);
 	void garbageCollect();
 	VkDescriptorSet descriptorSet();
@@ -1052,7 +1055,6 @@ protected:
 	bool m_bSupportsStorageImageWriteWithoutFormat = false;
 	uint32_t m_uVendorID = 0;
 	VkDriverId m_driverID = VK_DRIVER_ID_MAX_ENUM;
-	uint32_t m_uUniformBufferAlignment = 16;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bSupportsClientDmabufs = true;
@@ -1060,6 +1062,7 @@ protected:
 
 
 	VkPhysicalDeviceMemoryProperties m_memoryProperties;
+	uint32_t m_uUniformBufferAlignment = 16;
 
 	std::unordered_map< SamplerState, VkSampler > m_samplerCache;
 	std::array<VkShaderModule, SHADER_TYPE_COUNT> m_shaderModules;
@@ -1130,7 +1133,6 @@ public:
 	void uploadConstants(Args&&... args);
 	void bindPipeline(VkPipeline pipeline);
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
-	void bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTexture *linearSource = nullptr);
 	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> region = std::nullopt);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);
@@ -1153,6 +1155,12 @@ public:
 	const std::vector<VulkanTimelinePoint_t> &GetExternalSignals() const { return m_ExternalSignals; }
 
 private:
+	friend class CVulkanDevice;
+	VkSemaphore m_completionSemaphore = VK_NULL_HANDLE;
+	std::optional<int> m_completionFd;
+	bool m_signalCompletion = false;
+	bool m_completionExportFailed = false;
+	void bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTexture *linearSource = nullptr);
 	VkCommandBuffer m_cmdBuffer;
 	CVulkanDevice *m_device;
 
