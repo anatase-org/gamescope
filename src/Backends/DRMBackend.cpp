@@ -113,6 +113,7 @@ struct drm_t {
 	bool allow_modifiers;
 	struct wlr_drm_format_set formats;
 	bool is_nvidia = false;
+	bool is_vc4 = false;
 #if HAVE_GBM
 	struct gbm_device *gbm = nullptr;
 #endif
@@ -1296,9 +1297,11 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 	}
 
 	drm->is_nvidia = false;
+	drm->is_vc4 = false;
 	if ( drmVersion *pVersion = drmGetVersion( drm->fd ) )
 	{
 		drm->is_nvidia = pVersion->name && strcmp( pVersion->name, "nvidia-drm" ) == 0;
+		drm->is_vc4 = pVersion->name && strcmp( pVersion->name, "vc4" ) == 0;
 		drmFreeVersion( pVersion );
 	}
 
@@ -1395,7 +1398,9 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 	// 2. When compositing HDR content as a fallback when we undock, it avoids introducing
 	// a bunch of horrible banding when going to G2.2 curve.
 	// It ensures that we can dither that.
-	g_nDRMFormat = pick_plane_format(&drm->primary_formats, DRM_FORMAT_XRGB2101010, DRM_FORMAT_ARGB2101010);
+	g_nDRMFormat = drm->is_vc4
+		? pick_plane_format(&drm->primary_formats, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888)
+		: pick_plane_format(&drm->primary_formats, DRM_FORMAT_XRGB2101010, DRM_FORMAT_ARGB2101010);
 	if ( g_nDRMFormat == DRM_FORMAT_INVALID ) {
 		g_nDRMFormat = pick_plane_format(&drm->primary_formats, DRM_FORMAT_XBGR2101010, DRM_FORMAT_ABGR2101010);
 		if ( g_nDRMFormat == DRM_FORMAT_INVALID ) {
@@ -1450,11 +1455,11 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 	drm->needs_modeset = true;
 
 #if HAVE_GBM
-	if ( drm->is_nvidia )
+	if ( drm->is_nvidia || drm->is_vc4 )
 	{
 		drm->gbm = gbm_create_device( drm->fd );
 		if ( !drm->gbm )
-			drm_log.errorf( "Failed to create GBM device for NVIDIA scanout buffers; Vulkan scanout allocation will be used." );
+			drm_log.errorf( "Failed to create GBM device for scanout buffers; Vulkan scanout allocation will be used." );
 	}
 #endif
 
@@ -4012,7 +4017,7 @@ namespace gamescope
 
 		virtual bool UsesBackendAllocatedScanout() const override
 		{
-			return g_DRM.is_nvidia;
+			return g_DRM.is_nvidia || g_DRM.is_vc4;
 		}
 
 		virtual bool CreateScanoutDmabuf( uint32_t uWidth, uint32_t uHeight, uint32_t uDrmFormat,

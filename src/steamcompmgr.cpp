@@ -1501,7 +1501,7 @@ import_commit (
 	}
 
 	gamescope::OwningRc<gamescope::IBackendFb> pBackendFb;
-	if ( bDmabuf )
+	if ( bDmabuf && !GetBackend()->UsesBackendAllocatedScanout() )
 	{
 		pBackendFb = GetBackend()->ImportDmabufToBackend( &dmabuf );
 	}
@@ -2800,7 +2800,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 			if ( overlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
 				update_touch_scaling( &frameInfo );
 		}
-		else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
+		else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() && !GetBackend()->UsesBackendAllocatedScanout() )
 		{
 			auto tex = vulkan_get_hacky_blank_texture();
 			if ( tex != nullptr )

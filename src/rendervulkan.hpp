@@ -188,6 +188,8 @@ public:
 	inline const struct wlr_dmabuf_attributes& dmabuf() { return m_dmabuf; }
 	inline VkImage vkImage() { return m_vkImage; }
 	inline bool outputImage() { return m_bOutputImage; }
+	inline bool colorAttachment() const { return m_bColorAttachment; }
+	inline bool storageImage() const { return m_bStorage; }
 	inline bool externalImage() { return m_bExternal; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
@@ -221,6 +223,8 @@ private:
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
+	bool m_bColorAttachment = false;
+	bool m_bStorage = false;
 	bool m_bOwnsImage = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
@@ -627,6 +631,7 @@ struct VulkanOutput_t
 	uint32_t nOutImage; // swapchain index in nested mode, or ping/pong between two RTs
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImages;
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImagesPartialOverlay;
+	gamescope::OwningRc<CVulkanTexture> compositionScratch;
 	gamescope::OwningRc<CVulkanTexture> temporaryHackyBlankImage;
 
 	uint32_t uOutputFormat = DRM_FORMAT_INVALID;

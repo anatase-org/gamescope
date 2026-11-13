@@ -422,7 +422,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 					vk_log.infof("Intel device detected, forcing general queue family instead of compute-only queue");
 					m_queueFamily = generalIndex;
 				}
-				else if ( env_to_bool( getenv( "GAMESCOPE_FORCE_GENERAL_QUEUE" ) ) )
+				else if ( GetBackend()->UsesBackendAllocatedScanout() || env_to_bool( getenv( "GAMESCOPE_FORCE_GENERAL_QUEUE" ) ) )
 					m_queueFamily = generalIndex;
 			}
 		}
@@ -2219,7 +2219,13 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 {
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
+	m_bColorAttachment = flags.bColorAttachment;
+	m_bStorage = flags.bStorage;
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
+	// Forced composition only scans out backend-allocated outputs. Sampled
+	// intermediates and client uploads need no separate KMS allocation.
+	if ( GetBackend()->UsesBackendAllocatedScanout() && flags.bSampled && !flags.bOutputImage )
+		flags.bFlippable = false;
 
 	VkImageTiling tiling = (flags.bMappable || flags.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
 	VkImageUsageFlags usage = 0;
@@ -2488,7 +2494,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		VkMemoryDedicatedAllocateInfo memory_dedicated_info = {};
 		struct wsi_memory_allocate_info memory_wsi_info = {};
 
-		if ( flags.bFlippable == true )
+		if ( flags.bFlippable == true && !( pDMA && g_device.isV3dv() ) )
 		{
 			memory_wsi_info = {
 				.sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
@@ -2771,7 +2777,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 		}
 
-		if ( flags.bSampled )
+		if ( flags.bSampled || flags.bColorAttachment )
 		{
 			VkImageViewUsageCreateInfo viewUsageInfo = {
 				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
@@ -3655,6 +3661,8 @@ static std::vector<uint64_t> vulkan_get_backend_scanout_modifiers( VulkanOutput_
 
 	for ( uint64_t ulModifier : GetBackend()->GetSupportedModifiers( pOutput->uOutputFormat ) )
 	{
+		if ( g_device.isV3dv() && ulModifier != DRM_FORMAT_MOD_LINEAR )
+			continue;
 		if ( ulModifier == DRM_FORMAT_MOD_INVALID )
 			continue;
 		if ( bHasOverlay &&
@@ -3664,6 +3672,21 @@ static std::vector<uint64_t> vulkan_get_backend_scanout_modifiers( VulkanOutput_
 	}
 
 	return modifiers;
+}
+
+// GBM placement and Vulkan image usage are separate capabilities. In particular,
+// linear scanout can be a color attachment without supporting storage or sampling.
+static bool dmabuf_supports_usage(uint32_t format, uint64_t modifier, VkImageUsageFlags usage)
+{
+	VkImageCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D, .format = DRMFormatToVulkan(format, false),
+		.extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkExternalImageFormatProperties external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+	return getModifierProps(&info, modifier, &external) == VK_SUCCESS &&
+		(external.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
 }
 
 static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
@@ -3682,10 +3705,24 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 			uWidth, uHeight, pOutput->uOutputFormat, modifiers, &dmabuf ) )
 			return false;
 
+		auto flags = outputImageflags;
+		const VkImageUsageFlags attachmentUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		if (!dmabuf_supports_usage(pOutput->uOutputFormat, dmabuf.modifier,
+			attachmentUsage | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+		{
+			flags.bStorage = false;
+			flags.bSampled = false;
+			if (!dmabuf_supports_usage(pOutput->uOutputFormat, dmabuf.modifier, attachmentUsage))
+			{
+				wlr_dmabuf_attributes_finish(&dmabuf);
+				return false;
+			}
+		}
+
 		pOutput->outputImages[i] = new CVulkanTexture();
 		bool bSuccess = pOutput->outputImages[i]->BInit(
 			uWidth, uHeight, 1u, pOutput->uOutputFormat,
-			outputImageflags, &dmabuf );
+			flags, &dmabuf );
 
 		if ( bSuccess && bHasOverlay )
 		{
@@ -3694,7 +3731,7 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
 			bSuccess = pOutput->outputImagesPartialOverlay[i]->BInit(
 				uWidth, uHeight, 1u, pOutput->uOutputFormatOverlay,
-				outputImageflags, &overlayDmabuf );
+				flags, &overlayDmabuf );
 		}
 
 		wlr_dmabuf_attributes_finish( &dmabuf );
@@ -3707,9 +3744,12 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 
 static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 {
+	pOutput->compositionScratch = nullptr;
 	CVulkanTexture::createFlags outputImageflags;
 	outputImageflags.bFlippable = true;
 	outputImageflags.bStorage = true;
+	outputImageflags.bColorAttachment = true;
+	outputImageflags.bTransferDst = true;
 	outputImageflags.bTransferSrc = true; // for screenshots
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
@@ -3743,7 +3783,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 			return true;
 		}
 
-		vk_log.errorf( "Failed to create NVIDIA GBM scanout buffers; falling back to Vulkan scanout allocation." );
+		vk_log.errorf( "Failed to create backend GBM scanout buffers; falling back to Vulkan scanout allocation." );
 		for ( auto &pImage : pOutput->outputImages )
 			pImage = nullptr;
 		for ( auto &pImage : pOutput->outputImagesPartialOverlay )
@@ -4628,11 +4668,21 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		g_reshadeManager.clear();
 	}
 
-	gamescope::Rc<CVulkanTexture> compositeImage;
-	if ( pOutputOverride )
-		compositeImage = pOutputOverride;
-	else
-		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
+	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
+		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
+	if ( !pOutputOverride && !scanout->storageImage() && !g_output.compositionScratch )
+	{
+		CVulkanTexture::createFlags flags;
+		flags.bStorage = flags.bSampled = flags.bTransferSrc = flags.bTransferDst = true;
+		g_output.compositionScratch = new CVulkanTexture();
+		if ( !g_output.compositionScratch->BInit(scanout->width(), scanout->height(), 1, scanout->drmFormat(), flags) )
+		{
+			g_output.compositionScratch = nullptr;
+			return std::nullopt;
+		}
+	}
+	gamescope::Rc<CVulkanTexture> compositeImage = !pOutputOverride && g_output.compositionScratch
+		? g_output.compositionScratch.get() : scanout.get();
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 
@@ -4905,6 +4955,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		if ( pPipewireTexture->isReadback() )
 			cmdBuffer->copyImageToReadback(pPipewireTexture);
 	}
+
+	if ( compositeImage != scanout )
+		cmdBuffer->copyImage(compositeImage, scanout);
 
 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
 
