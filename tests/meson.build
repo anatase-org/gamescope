@@ -10,6 +10,9 @@ test_frame_generation_config = executable(
 )
 test('frame-generation-config', test_frame_generation_config)
 
+test('benchmark-tools', find_program('python3', native: true),
+  args: [files('test_benchmark.py')])
+
 if catch2_dep.found()
 	unittest_src = []
 	foreach src : gamescope_core_src + ['Script/Script.cpp', 'convar_script.cpp']

@@ -1,14 +1,17 @@
 #!/bin/sh
 
 usage() {
-    echo "Usage: $0 [--arch native|arm] [--appid ID] <host>"
+    echo "Usage: $0 [--arch native|arm] [--appid ID | --test RESULT_FILE] <host>"
     echo "  ARM builds use aarch64-linux-gnu tools and AARCH64_SYSROOT"
     echo "  (default: build-arm/sysroot if present, otherwise /usr/aarch64-linux-gnu/sys-root)."
+    echo "  --test launches an isolated benchmark without Steam and saves local results."
 }
 
 HOST=
 APPID=
 ARCH=native
+TEST_RESULT=
+TEST_FINISHED=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -28,6 +31,15 @@ while [ "$#" -gt 0 ]; do
                 exit 1
             fi
             APPID=$2
+            shift 2
+            ;;
+        --test)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--test requires a local result filename" >&2
+                exit 1
+            fi
+            case "$2" in -*) echo "--test requires a local result filename" >&2; exit 1 ;; esac
+            TEST_RESULT=$2
             shift 2
             ;;
         -h|--help)
@@ -63,6 +75,22 @@ case "$APPID" in
         exit 1
         ;;
 esac
+
+if [ -n "$TEST_RESULT" ] && [ -n "$APPID" ]; then
+    echo "--test and --appid cannot be combined" >&2
+    exit 1
+fi
+
+test_cleanup() {
+    status=$?
+    if [ -n "$TEST_RESULT" ] && [ "$TEST_FINISHED" != 1 ] && [ "$status" -ne 0 ]; then
+        python3 tools/benchmark.py failure --result "$TEST_RESULT" \
+            --error "sync build or transfer failed (exit $status)" || true
+    fi
+}
+trap test_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 set -e
 
@@ -169,6 +197,18 @@ if [ -f "$BUILD_DIR/build.ninja" ]; then
 fi
 meson setup "$BUILD_DIR" "$@" --buildtype=debugoptimized --prefix=/usr --libdir=lib64 -Dforce_fallback_for=stb,libdisplay-info,libliftoff,wlroots,vkroots -Denable_openvr_support=false
 ninja -C "$BUILD_DIR"
+
+if [ -n "$TEST_RESULT" ]; then
+    if python3 tools/benchmark.py local --host "$HOST" --build-dir "$BUILD_DIR" --result "$TEST_RESULT"; then
+        TEST_FINISHED=1
+        exit 0
+    else
+        status=$?
+        TEST_FINISHED=1
+        exit "$status"
+    fi
+fi
+
 scp "$BUILD_DIR/src/gamescope" "${HOST}:gamescope"
 scp "$BUILD_DIR/layer/libVkLayer_FROG_gamescope_wsi_${TARGET_ARCH}.so" "${HOST}:gamescope-wsi.so"
 
