@@ -62,11 +62,122 @@
 #include "cs_rgb_to_nv12.h"
 #include "cs_rotation.h"
 
+gamescope::ConVar<bool> cv_raster_damage("raster_damage", true, "Reuse input shadows and output contents outside client damage.");
+
+
+struct CompositeState_t
+{
+	struct Layer
+	{
+		uint64_t texture = 0, version = 0;
+		SurfaceDamage damage;
+		std::array<float, 5> geometry{}; // scale, pixel-center offset, opacity
+		std::array<uint32_t, 2> size{};
+		std::array<uint32_t, 6> flags{}; // colorspace, filter, alpha mode, black border, format, applied color management
+		std::array<float, 12> ctm{};
+		bool operator==(const Layer &) const = default;
+	};
+	std::array<Layer, k_nMaxLayers> layers{};
+	std::array<uint64_t, EOTF_Count * 4> luts{};
+	CompositeShaderConfig_t config;
+	EOTF outputTF;
+	int layerCount;
+};
+
+static CompositeState_t composite_state(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config)
+{
+	CompositeState_t state{};
+	state.config = config;
+	state.outputTF = outputTF;
+	state.layerCount = frame->layerCount;
+	for (int i = 0; i < frame->layerCount; ++i)
+	{
+		const auto &layer = frame->layers[i];
+		auto &s = state.layers[i];
+		s.texture = layer.tex->textureID;
+		s.version = layer.tex->contentVersion.load(std::memory_order_relaxed);
+		if (layer.damage.texture == s.texture)
+			s.damage = layer.damage;
+		const auto offset = layer.offsetPixelCenter();
+		s.geometry = {layer.scale.x, layer.scale.y, offset.x, offset.y, layer.opacity};
+		s.size = {layer.tex->width(), layer.tex->height()};
+		s.flags = {uint32_t(layer.colorspace), uint32_t(layer.filter), uint32_t(layer.eAlphaBlendingMode), uint32_t(layer.blackBorder), uint32_t(layer.tex->format()), uint32_t(layer.outputColorMgmtApplied)};
+		if (layer.ctm)
+		{
+			const auto &matrix = layer.ctm->View<glm::mat3x4>();
+			memcpy(s.ctm.data(), &matrix, sizeof(matrix));
+		}
+	}
+	for (int i = 0; i < EOTF_Count; ++i)
+	{
+		if (frame->shaperLut[i])
+		{
+			state.luts[4 * i] = frame->shaperLut[i]->textureID;
+			state.luts[4 * i + 1] = frame->shaperLut[i]->contentVersion.load(std::memory_order_relaxed);
+		}
+		if (frame->lut3D[i])
+		{
+			state.luts[4 * i + 2] = frame->lut3D[i]->textureID;
+			state.luts[4 * i + 3] = frame->lut3D[i]->contentVersion.load(std::memory_order_relaxed);
+		}
+	}
+	return state;
+}
+
+static VkRect2D composite_layer_bounds(const CompositeState_t::Layer &s, uint32_t width, uint32_t height)
+{
+	if (s.flags[3])
+		return {{0, 0}, {width, height}};
+	const float x = float(s.size[0]) / s.geometry[0], y = float(s.size[1]) / s.geometry[1];
+	const int left = std::clamp(int(floorf(std::min(0.0f, x) - s.geometry[2])), 0, int(width));
+	const int top = std::clamp(int(floorf(std::min(0.0f, y) - s.geometry[3])), 0, int(height));
+	const int right = std::clamp(int(ceilf(std::max(0.0f, x) - s.geometry[2])) + 1, left, int(width));
+	const int bottom = std::clamp(int(ceilf(std::max(0.0f, y) - s.geometry[3])) + 1, top, int(height));
+	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+}
+
+static VkRect2D intersect_rect(VkRect2D a, VkRect2D b)
+{
+	const int x = std::max(a.offset.x, b.offset.x), y = std::max(a.offset.y, b.offset.y);
+	const int right = std::min(a.offset.x + int(a.extent.width), b.offset.x + int(b.extent.width));
+	const int bottom = std::min(a.offset.y + int(a.extent.height), b.offset.y + int(b.extent.height));
+	return {{x, y}, {uint32_t(std::max(0, right - x)), uint32_t(std::max(0, bottom - y))}};
+}
+
+static VkRect2D union_rect(VkRect2D a, VkRect2D b)
+{
+	if (!a.extent.width || !a.extent.height) return b;
+	if (!b.extent.width || !b.extent.height) return a;
+	const int x = std::min(a.offset.x, b.offset.x), y = std::min(a.offset.y, b.offset.y);
+	const int right = std::max(a.offset.x + int(a.extent.width), b.offset.x + int(b.extent.width));
+	const int bottom = std::max(a.offset.y + int(a.extent.height), b.offset.y + int(b.extent.height));
+	return {{x, y}, {uint32_t(right - x), uint32_t(bottom - y)}};
+}
+
+static VkRect2D composite_damage_bounds(const CompositeState_t::Layer &s, wlr_box damage, uint32_t width, uint32_t height)
+{
+	if (damage.width <= 0 || damage.height <= 0)
+		return {};
+	// Include filtering footprints and fractional output positions. The normal
+	// raster path excludes wider reconstruction filters and rotations.
+	const float x1 = (damage.x - 1.0f) / s.geometry[0] - s.geometry[2];
+	const float x2 = (damage.x + damage.width + 1.0f) / s.geometry[0] - s.geometry[2];
+	const float y1 = (damage.y - 1.0f) / s.geometry[1] - s.geometry[3];
+	const float y2 = (damage.y + damage.height + 1.0f) / s.geometry[1] - s.geometry[3];
+	const int left = std::clamp(int(floorf(std::min(x1, x2))), 0, int(width));
+	const int top = std::clamp(int(floorf(std::min(y1, y2))), 0, int(height));
+	const int right = std::clamp(int(ceilf(std::max(x1, x2))) + 1, left, int(width));
+	const int bottom = std::clamp(int(ceilf(std::max(y1, y2))) + 1, top, int(height));
+	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+}
+
 #define A_CPU
 #include "shaders/ffx_a.h"
 #include "shaders/ffx_fsr1.h"
 
 #include "reshade_effect_manager.hpp"
+
+ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
 extern bool g_bWasPartialComposite;
 extern bool g_bAllowDeferredBackend;
@@ -2012,65 +2123,114 @@ void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint)
 
 }
 
-static VkRect2D raster_layer_bounds(const FrameInfo_t::Layer_t &layer, uint32_t width, uint32_t height)
-{
-	if (layer.blackBorder)
-		return {{0, 0}, {width, height}};
-	const auto offset = layer.offsetPixelCenter();
-	const float x = float(layer.tex->width()) / layer.scale.x, y = float(layer.tex->height()) / layer.scale.y;
-	const int left = std::clamp(int(floorf(std::min(0.0f, x) - offset.x)), 0, int(width));
-	const int top = std::clamp(int(floorf(std::min(0.0f, y) - offset.y)), 0, int(height));
-	const int right = std::clamp(int(ceilf(std::max(0.0f, x) - offset.x)) + 1, left, int(width));
-	const int bottom = std::clamp(int(ceilf(std::max(0.0f, y) - offset.y)) + 1, top, int(height));
-	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
-}
-
 void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase)
 {
-	VkRect2D renderArea = {{0, 0}, {m_target->width(), m_target->height()}};
+	const bool cacheable = cv_raster_damage && kDisablePartialComposition && m_target->outputImage() &&
+		!GetBackend()->UsesVulkanSwapchain() && !frame->frameGenerationActive && !g_pLastReshadeEffect;
+	auto state = composite_state(frame, outputTF, config);
+	const auto *previous = cacheable ? m_target->compositeState.get() : nullptr;
+	VkRect2D damage = {{0, 0}, {m_target->width(), m_target->height()}};
+	if (previous && previous->layerCount == state.layerCount && previous->outputTF == state.outputTF &&
+		previous->config == state.config && previous->luts == state.luts)
+	{
+		int left = m_target->width(), top = m_target->height(), right = 0, bottom = 0;
+		for (int i = 0; i < state.layerCount; ++i)
+		{
+			if (previous->layers[i] == state.layers[i])
+				continue;
+			const auto &old = previous->layers[i], &current = state.layers[i];
+			if (old.damage.history && old.damage.history == current.damage.history &&
+				old.geometry == current.geometry && old.size == current.size && old.flags == current.flags && old.ctm == current.ctm &&
+				frame->layers[i].shaderFilter() != GamescopeUpscaleFilter::PIXEL)
+			{
+				if (auto changed = current.damage.history->Between(old.damage.sequence, current.damage.sequence))
+				{
+					auto r = composite_damage_bounds(current, *changed, m_target->width(), m_target->height());
+					if (r.extent.width && r.extent.height)
+					{
+						left = std::min(left, r.offset.x); top = std::min(top, r.offset.y);
+						right = std::max(right, r.offset.x + int(r.extent.width));
+						bottom = std::max(bottom, r.offset.y + int(r.extent.height));
+					}
+					continue;
+				}
+			}
+			for (const auto *layer : std::array<const CompositeState_t::Layer *, 2>{&previous->layers[i], &state.layers[i]})
+			{
+				const auto r = composite_layer_bounds(*layer, m_target->width(), m_target->height());
+				left = std::min(left, r.offset.x); top = std::min(top, r.offset.y);
+				right = std::max(right, r.offset.x + int(r.extent.width));
+				bottom = std::max(bottom, r.offset.y + int(r.extent.height));
+			}
+		}
+		if (right <= left || bottom <= top)
+		{
+			m_target->compositeState = std::make_unique<CompositeState_t>(std::move(state));
+			return;
+		}
+		damage = {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+	}
+
+	const bool preserve = previous && (damage.offset.x != 0 || damage.offset.y != 0 ||
+		damage.extent.width != m_target->width() || damage.extent.height != m_target->height());
+	VkRect2D renderDamage = damage;
 	if (copyBase)
 	{
-		copyImage(frame->layers[0].tex, m_target);
-		renderArea = {};
-		for (int i = 1; i < frame->layerCount; ++i)
-		{
-			auto box = raster_layer_bounds(frame->layers[i], m_target->width(), m_target->height());
-			if (!box.extent.width || !box.extent.height) continue;
-			if (!renderArea.extent.width || !renderArea.extent.height) { renderArea = box; continue; }
-			int left = std::min(renderArea.offset.x, box.offset.x), top = std::min(renderArea.offset.y, box.offset.y);
-			int right = std::max(renderArea.offset.x + int(renderArea.extent.width), box.offset.x + int(box.extent.width));
-			int bottom = std::max(renderArea.offset.y + int(renderArea.extent.height), box.offset.y + int(box.extent.height));
-			renderArea = {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
-		}
-		if (!renderArea.extent.width || !renderArea.extent.height) return;
+		renderDamage = {};
+		for (int i = 1; i < state.layerCount; ++i)
+			renderDamage = union_rect(renderDamage, composite_layer_bounds(state.layers[i], m_target->width(), m_target->height()));
+		renderDamage = intersect_rect(renderDamage, damage);
+	}
+	if (copyBase)
+		copyImage(frame->layers[0].tex, m_target, damage);
+	if (!renderDamage.extent.width || !renderDamage.extent.height)
+	{
+		if (cacheable)
+			m_target->compositeState = std::make_unique<CompositeState_t>(std::move(state));
+		return;
 	}
 	for (uint32_t i = copyBase ? 1 : 0; i < m_boundTextures.size(); ++i)
-		if (m_boundTextures[i])
-			prepareSrcImage(m_boundTextures[i]);
-	prepareDestImage(m_target);
+	{
+		auto *src = m_boundTextures[i];
+		if (!src)
+			continue;
+		prepareSrcImage(src);
+	}
+	// Copies into sampled shadows advance the version during prepareSrcImage.
+	for (int i = 0; i < frame->layerCount; ++i)
+		state.layers[i].version = frame->layers[i].tex->contentVersion.load(std::memory_order_relaxed);
+	prepareDestImage(m_target, !preserve);
 	insertBarrier();
 	bindDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS);
+
 	VkRenderingAttachmentInfo attachment = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
 		.imageView = outputTF == EOTF_Gamma22 ? m_target->linearView() : m_target->srgbView(),
 		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-		.loadOp = copyBase ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.loadOp = preserve || copyBase ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	};
 	VkRenderingInfo rendering = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-		.renderArea = renderArea, .layerCount = 1,
+		.renderArea = renderDamage, .layerCount = 1,
 		.colorAttachmentCount = 1, .pColorAttachments = &attachment,
 	};
 	m_device->vk.CmdBeginRendering(m_cmdBuffer, &rendering);
-	VkViewport viewport = {0.0f, 0.0f, float(m_target->width()), float(m_target->height()), 0.0f, 1.0f};
+	if (preserve && !copyBase)
+	{
+		VkClearAttachment clear = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0 };
+		VkClearRect rect = { .rect = damage, .baseArrayLayer = 0, .layerCount = 1 };
+		m_device->vk.CmdClearAttachments(m_cmdBuffer, 1, &clear, 1, &rect);
+	}
+	VkViewport viewport = { 0.0f, 0.0f, float(m_target->width()), float(m_target->height()), 0.0f, 1.0f };
 	m_device->vk.CmdSetViewport(m_cmdBuffer, 0, 1, &viewport);
 	config.renderFormat = outputTF == EOTF_Gamma22 ? ToSrgbVulkanFormat(m_target->format()) : m_target->format();
 	for (int i = copyBase ? 1 : 0; i < frame->layerCount; ++i)
 	{
-		VkRect2D scissor = raster_layer_bounds(frame->layers[i], m_target->width(), m_target->height());
+		VkRect2D scissor = intersect_rect(composite_layer_bounds(state.layers[i], m_target->width(), m_target->height()), renderDamage);
 		if (!scissor.extent.width || !scissor.extent.height)
 			continue;
 		config.drawLayer = i;
+
 		VkPipeline pipeline = m_device->pipeline(SHADER_TYPE_BLIT, frame->layerCount, frame->ycbcrMask(), 0,
 			frame->colorspaceMask(), outputTF, false, false, false, config);
 		m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -2079,20 +2239,25 @@ void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, Co
 	}
 	m_device->vk.CmdEndRendering(m_cmdBuffer);
 	markDirty(m_target);
+	if (cacheable)
+		m_target->compositeState = std::make_unique<CompositeState_t>(std::move(state));
 }
 
-void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst)
+void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> rect)
 {
 	assert(src->width() == dst->width());
 	assert(src->height() == dst->height());
 	if (src->linearSource && src->linearSourceDirty)
 	{
+		// A raw copy can read the producer directly, without first refreshing the
+		// sampled shadow. Retain its explicit release point until this copy ends.
 		src->ReferenceReleasePoints(m_releasePointRefs);
 		m_textureRefs.emplace_back(src);
 		src = src->linearSource;
 	}
 	prepareSrcImage(src.get());
-	prepareDestImage(dst.get());
+	prepareDestImage(dst.get(), !rect || (rect->offset.x == 0 && rect->offset.y == 0 &&
+		rect->extent.width == dst->width() && rect->extent.height == dst->height()));
 	insertBarrier();
 
 	VkImageCopy region = {
@@ -2100,13 +2265,15 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.layerCount = 1
 		},
+		.srcOffset = {rect ? rect->offset.x : 0, rect ? rect->offset.y : 0, 0},
 		.dstSubresource = {
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.layerCount = 1
 		},
+		.dstOffset = {rect ? rect->offset.x : 0, rect ? rect->offset.y : 0, 0},
 		.extent = {
-			.width = src->width(),
-			.height = src->height(),
+			.width = rect ? rect->extent.width : src->width(),
+			.height = rect ? rect->extent.height : src->height(),
 			.depth = 1
 		},
 	};
@@ -2214,9 +2381,26 @@ static uint32_t external_queue_family( CVulkanDevice *device )
 
 void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 {
-	if ( image->linearSource && image->linearSourceDirty && !m_textureState.contains(image) )
+	if ( image->linearSource && image->linearSourceDirty && !m_textureState.contains( image ) )
 	{
-		copyImage(image->linearSource, image);
+		std::optional<VkRect2D> region;
+		const auto &current = image->linearSourceDamage;
+		if (cv_raster_damage && current.history && current.history == image->sampledDamage.history)
+		{
+			if (auto damage = current.history->Between(image->sampledDamage.sequence, current.sequence))
+			{
+				const int left = std::clamp(damage->x, 0, int(image->width()));
+				const int top = std::clamp(damage->y, 0, int(image->height()));
+				const int right = std::clamp(damage->x + damage->width, left, int(image->width()));
+				const int bottom = std::clamp(damage->y + damage->height, top, int(image->height()));
+				region = VkRect2D{{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+			}
+		}
+		// Each client buffer has its own shadow. Accumulate surface damage since
+		// that shadow was sampled, including commits that used other buffers.
+		if (!region || (region->extent.width && region->extent.height))
+			copyImage(image->linearSource, image, region);
+		image->sampledDamage = current;
 		image->linearSourceDirty = false;
 	}
 	auto result = m_textureState.emplace(image, TextureState());
@@ -2231,14 +2415,14 @@ void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 	result.first->second.needsExport = image->externalImage();
 }
 
-void CVulkanCmdBuffer::prepareDestImage(CVulkanTexture *image)
+void CVulkanCmdBuffer::prepareDestImage(CVulkanTexture *image, bool discard)
 {
 	auto result = m_textureState.emplace(image, TextureState());
 	// no need to discard if the image is already image/in the correct layout
 	if (!result.second)
 		return;
 	image->ReferenceReleasePoints( m_releasePointRefs );
-	result.first->second.discarded = true;
+	result.first->second.discarded = discard;
 	result.first->second.needsImport =
 		image->queueFamily == external_queue_family( m_device );
 	result.first->second.needsExport = image->externalImage();
@@ -2256,6 +2440,7 @@ void CVulkanCmdBuffer::discardImage(CVulkanTexture *image)
 void CVulkanCmdBuffer::markDirty(CVulkanTexture *image)
 {
 	++image->contentVersion;
+	image->compositeState.reset();
 	auto result = m_textureState.find(image);
 	// image should have been prepared already
 	assert(result !=  m_textureState.end());
@@ -4793,7 +4978,7 @@ bool vulkan_capture_prefers_readback( void )
 extern std::string g_reshade_effect;
 extern uint32_t g_reshade_technique_idx;
 
-ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
+
 
 static bool is_8bit_sdr_target( const CVulkanTexture *texture )
 {

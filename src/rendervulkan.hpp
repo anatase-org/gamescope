@@ -22,6 +22,7 @@
 #include "shaders/descriptor_set_constants.h"
 
 class CVulkanCmdBuffer;
+struct CompositeState_t;
 
 // 1: Fade Plane (Fade outs between switching focus)
 // 2: Video Underlay (The actual video)
@@ -225,6 +226,7 @@ public:
 	SurfaceDamage linearSourceDamage, sampledDamage;
 	uint64_t textureID = 0;
 	std::atomic<uint64_t> contentVersion = {0};
+	std::unique_ptr<CompositeState_t> compositeState;
 	std::vector<uint16_t> uploadedLut;
 	bool identityLut = false;
 	bool blackPreservingLut = false;
@@ -839,6 +841,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdBindDescriptorSets) \
 	VK_FUNC(CmdBindPipeline) \
 	VK_FUNC(CmdClearColorImage) \
+	VK_FUNC(CmdClearAttachments) \
 	VK_FUNC(CmdCopyBufferToImage) \
 	VK_FUNC(CmdCopyImageToBuffer) \
 	VK_FUNC(CmdCopyImage) \
@@ -1122,13 +1125,13 @@ public:
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
 	void bindDescriptors(VkPipelineBindPoint bindPoint);
 	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase);
-	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
+	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> region = std::nullopt);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
 
 
 	void prepareSrcImage(CVulkanTexture *image);
-	void prepareDestImage(CVulkanTexture *image);
+	void prepareDestImage(CVulkanTexture *image, bool discard = true);
 	void discardImage(CVulkanTexture *image);
 	void markDirty(CVulkanTexture *image);
 	void insertBarrier(bool flush = false);
