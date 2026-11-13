@@ -904,6 +904,7 @@ public:
 
 	inline VkDevice device() { return m_device; }
 	inline VkPhysicalDevice physDev() {return m_physDev; }
+	inline bool isV3dv() const { return m_driverID == VK_DRIVER_ID_MESA_V3DV; }
 	inline VkInstance instance() { return m_instance; }
 	inline VkQueue queue() {return m_queue;}
 	inline VkQueue generalQueue() {return m_generalQueue;}
@@ -987,6 +988,8 @@ protected:
 	bool m_bSupportsStorageImageReadWithoutFormat = false;
 	bool m_bSupportsStorageImageWriteWithoutFormat = false;
 	uint32_t m_uVendorID = 0;
+	VkDriverId m_driverID = VK_DRIVER_ID_MAX_ENUM;
+	uint32_t m_uUniformBufferAlignment = 16;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bSupportsClientDmabufs = true;
@@ -1108,6 +1111,7 @@ private:
 	std::vector<VkDescriptorSet> m_descriptorSets;
 
 	uint32_t m_renderBufferOffset = 0;
+	uint32_t m_renderBufferSize = 0;
 };
 
 uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );

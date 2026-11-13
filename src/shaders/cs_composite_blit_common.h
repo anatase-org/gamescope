@@ -31,10 +31,14 @@ void main() {
         outputValue = sampleLayer(0, uv) * u_opacity[0];
     }
 
-    for (int i = 1; i < c_layerCount; i++) {
-        vec4 layerColor = sampleLayer(i, uv);
-        outputValue = BlendLayer( i, outputValue, layerColor, u_opacity[i] );
-    }
+    // Keep sampler indices constant on drivers without dynamic array indexing.
+#define BLEND_LAYER(i) if (c_layerCount > i) outputValue = BlendLayer(i, outputValue, sampleLayer(i, uv), u_opacity[i]);
+    BLEND_LAYER(1)
+    BLEND_LAYER(2)
+    BLEND_LAYER(3)
+    BLEND_LAYER(4)
+    BLEND_LAYER(5)
+#undef BLEND_LAYER
 
     outputValue.rgb = encodeOutputColor(outputValue.rgb);
     imageStore(dst, ivec2(coord), outputValue);

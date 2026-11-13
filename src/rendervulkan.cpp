@@ -444,6 +444,8 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 	vk.GetPhysicalDeviceProperties2( m_physDev, &props2 );
 	const VkPhysicalDeviceProperties &props = props2.properties;
 	m_uVendorID = props.vendorID;
+	m_driverID = driverProps.driverID;
+	m_uUniformBufferAlignment = std::max<uint32_t>(16, props.limits.minUniformBufferOffsetAlignment);
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
 
 	// Venus currently aborts when importing DMA-BUFs from the guest's virtio-gpu
@@ -961,6 +963,13 @@ bool CVulkanDevice::createPools()
 		},
 	};
 	
+	if ( isV3dv() )
+	{
+		// V3DV applies the YCbCr plane stride to unrelated bindings too.
+		for ( auto &poolSize : poolSizes )
+			poolSize.descriptorCount *= 2;
+	}
+
 	VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 		.maxSets = uint32_t(m_descriptorSets.size()),
@@ -1734,8 +1743,9 @@ void CVulkanCmdBuffer::uploadConstants(Args&&... args)
 {
 	PushData data(std::forward<Args>(args)...);
 
-	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data));
+	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data), m_device->m_uUniformBufferAlignment);
 	m_renderBufferOffset = offset;
+	m_renderBufferSize = sizeof(data);
 	memcpy(ptr, &data, sizeof(data));
 }
 
@@ -1838,7 +1848,7 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 
 	scratchDescriptor.buffer = m_device->m_uploadBuffer;
 	scratchDescriptor.offset = m_renderBufferOffset;
-	scratchDescriptor.range = VK_WHOLE_SIZE;
+	scratchDescriptor.range = m_renderBufferSize;
 
 	for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; i++)
 	{
@@ -1866,13 +1876,13 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		nearestState.bUnnormalized = false;
 
 		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
-		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
 		// I need to change this, it's so utterly stupid and confusing.
 		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
 
 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
-		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
 	}
 
