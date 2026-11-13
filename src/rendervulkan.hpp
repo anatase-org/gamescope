@@ -840,6 +840,8 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdEndRendering) \
 	VK_FUNC(CmdPipelineBarrier) \
 	VK_FUNC(CmdPushConstants) \
+	VK_FUNC(CmdSetViewport) \
+	VK_FUNC(CmdSetScissor) \
 	VK_FUNC(CmdResetQueryPool) \
 	VK_FUNC(CmdWriteTimestamp) \
 	VK_FUNC(CreateBuffer) \
@@ -1044,6 +1046,8 @@ protected:
 
 	std::unordered_map< SamplerState, VkSampler > m_samplerCache;
 	std::array<VkShaderModule, SHADER_TYPE_COUNT> m_shaderModules;
+	VkShaderModule m_blitVertex = VK_NULL_HANDLE;
+	VkShaderModule m_blitFragment = VK_NULL_HANDLE;
 	std::unordered_map<PipelineInfo_t, VkPipeline> m_pipelineMap;
 	std::mutex m_pipelineMutex;
 
@@ -1109,6 +1113,8 @@ public:
 	void uploadConstants(Args&&... args);
 	void bindPipeline(VkPipeline pipeline);
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
+	void bindDescriptors(VkPipelineBindPoint bindPoint);
+	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);

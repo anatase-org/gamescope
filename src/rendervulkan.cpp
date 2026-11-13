@@ -43,6 +43,8 @@
 #include "Utils/Process.h"
 
 #include "cs_composite_blit.h"
+#include "vs_composite.h"
+#include "fs_composite.h"
 #include "cs_composite_blit_rgb10a2.h"
 #include "cs_composite_blur.h"
 #include "cs_composite_blur_cond.h"
@@ -833,44 +835,44 @@ bool CVulkanDevice::createLayouts()
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 1,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 2,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 3,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_SAMPLER_SLOTS,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 4,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_SAMPLER_SLOTS,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 			.pImmutableSamplers = ycbcrSamplers.data(),
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 5,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_LUT3D_COUNT,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 6,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_LUT3D_COUNT,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
 
@@ -1040,6 +1042,14 @@ bool CVulkanDevice::createShaders()
 			vk_errorf( res, "vkCreateShaderModule failed" );
 			return false;
 		}
+	}
+
+	for ( auto [words, size, module] : { std::tuple{ vs_composite, sizeof(vs_composite), &m_blitVertex },
+	                                  std::tuple{ fs_composite, sizeof(fs_composite), &m_blitFragment } } )
+	{
+		VkShaderModuleCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = words };
+		if ( vk.CreateShaderModule(device(), &info, nullptr, module) != VK_SUCCESS )
+			return false;
 	}
 
 	return true;
@@ -1253,6 +1263,58 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 	};
 
 
+
+	if ( composite_config.renderFormat != VK_FORMAT_UNDEFINED )
+	{
+		if (composite_config.drawLayer == 0)
+			vk_log.debugf("Raster pipeline: %u layers, colorspace %#x, filters %#x, color management %#x, sampling %#x, target %u",
+				layerCount, colorspace_mask, composite_config.filterMask, composite_config.colorMgmtMask, composite_config.samplingMask, composite_config.renderFormat);
+
+		VkPipelineShaderStageCreateInfo stages[] = {
+			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			  .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = m_blitVertex, .pName = "main" },
+			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			  .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = m_blitFragment, .pName = "main",
+			  .pSpecializationInfo = &specializationInfo },
+		};
+		VkPipelineVertexInputStateCreateInfo vertex = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+		VkPipelineInputAssemblyStateCreateInfo assembly = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+		VkPipelineViewportStateCreateInfo viewport = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+		VkPipelineRasterizationStateCreateInfo raster = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+			.polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+		VkPipelineMultisampleStateCreateInfo samples = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+		VkPipelineColorBlendAttachmentState blend = {
+			.blendEnable = composite_config.drawLayer != 0,
+			.srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			.colorBlendOp = VK_BLEND_OP_ADD,
+			.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			.alphaBlendOp = VK_BLEND_OP_ADD,
+			.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+		};
+		VkPipelineColorBlendStateCreateInfo blending = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blend };
+		VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+		VkPipelineDynamicStateCreateInfo dynamic = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynamicStates };
+		VkPipelineRenderingCreateInfo rendering = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+			.colorAttachmentCount = 1, .pColorAttachmentFormats = &composite_config.renderFormat };
+		VkGraphicsPipelineCreateInfo info = {
+			.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering,
+			.stageCount = 2, .pStages = stages, .pVertexInputState = &vertex, .pInputAssemblyState = &assembly,
+			.pViewportState = &viewport, .pRasterizationState = &raster, .pMultisampleState = &samples,
+			.pColorBlendState = &blending, .pDynamicState = &dynamic, .layout = m_pipelineLayout,
+		};
+		VkPipeline result = VK_NULL_HANDLE;
+		VkResult res = vk.CreateGraphicsPipelines(device(), VK_NULL_HANDLE, 1, &info, nullptr, &result);
+		if (res != VK_SUCCESS)
+			vk_errorf(res, "vkCreateGraphicsPipelines failed");
+		return result;
+	}
 
 	VkComputePipelineCreateInfo computePipelineCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -1798,6 +1860,13 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	prepareDestImage(m_target);
 	insertBarrier();
 
+	bindDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE);
+	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
+	markDirty(m_target);
+}
+
+void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint)
+{
 	VkDescriptorSet descriptorSet = m_device->descriptorSet();
 	m_descriptorSets.push_back( descriptorSet );
 
@@ -1919,7 +1988,11 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
 	}
 
-	if (!m_target->isYcbcr())
+	if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+	{
+		// Fragment shaders do not use the storage-image bindings.
+	}
+	else if (!m_target->isYcbcr())
 	{
 		targetDescriptors[0].imageView = m_target->srgbView();
 		targetDescriptors[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1935,10 +2008,59 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 
 	m_device->vk.UpdateDescriptorSets(m_device->device(), writeDescriptorSets.size(), writeDescriptorSets.data(), 0, nullptr);
 
-	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, bindPoint, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
 
-	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
+}
 
+static VkRect2D raster_layer_bounds(const FrameInfo_t::Layer_t &layer, uint32_t width, uint32_t height)
+{
+	if (layer.blackBorder)
+		return {{0, 0}, {width, height}};
+	const auto offset = layer.offsetPixelCenter();
+	const float x = float(layer.tex->width()) / layer.scale.x, y = float(layer.tex->height()) / layer.scale.y;
+	const int left = std::clamp(int(floorf(std::min(0.0f, x) - offset.x)), 0, int(width));
+	const int top = std::clamp(int(floorf(std::min(0.0f, y) - offset.y)), 0, int(height));
+	const int right = std::clamp(int(ceilf(std::max(0.0f, x) - offset.x)) + 1, left, int(width));
+	const int bottom = std::clamp(int(ceilf(std::max(0.0f, y) - offset.y)) + 1, top, int(height));
+	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+}
+
+void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config)
+{
+	for (auto *src : m_boundTextures)
+		if (src)
+			prepareSrcImage(src);
+	prepareDestImage(m_target);
+	insertBarrier();
+	bindDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS);
+	VkRenderingAttachmentInfo attachment = {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = outputTF == EOTF_Gamma22 ? m_target->linearView() : m_target->srgbView(),
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	};
+	VkRenderingInfo rendering = {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = {{0, 0}, {m_target->width(), m_target->height()}}, .layerCount = 1,
+		.colorAttachmentCount = 1, .pColorAttachments = &attachment,
+	};
+	m_device->vk.CmdBeginRendering(m_cmdBuffer, &rendering);
+	VkViewport viewport = {0.0f, 0.0f, float(m_target->width()), float(m_target->height()), 0.0f, 1.0f};
+	m_device->vk.CmdSetViewport(m_cmdBuffer, 0, 1, &viewport);
+	config.renderFormat = outputTF == EOTF_Gamma22 ? ToSrgbVulkanFormat(m_target->format()) : m_target->format();
+	for (int i = 0; i < frame->layerCount; ++i)
+	{
+		VkRect2D scissor = raster_layer_bounds(frame->layers[i], m_target->width(), m_target->height());
+		if (!scissor.extent.width || !scissor.extent.height)
+			continue;
+		config.drawLayer = i;
+		VkPipeline pipeline = m_device->pipeline(SHADER_TYPE_BLIT, frame->layerCount, frame->ycbcrMask(), 0,
+			frame->colorspaceMask(), outputTF, false, false, false, config);
+		m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_device->vk.CmdSetScissor(m_cmdBuffer, 0, 1, &scissor);
+		m_device->vk.CmdDraw(m_cmdBuffer, 3, 1, 0, 0);
+	}
+	m_device->vk.CmdEndRendering(m_cmdBuffer);
 	markDirty(m_target);
 }
 
@@ -2141,8 +2263,8 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		if (!state.discarded && !state.dirty && !state.needsImport && !isExport && !isPresent)
 			continue;
 
-		const VkAccessFlags write_bits = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		const VkAccessFlags write_bits = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
 
 		if (image->queueFamily == VK_QUEUE_FAMILY_IGNORED)
 			image->queueFamily = m_queueFamily;
@@ -2151,7 +2273,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		{
 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask = state.dirty ? write_bits : 0u,
-			.dstAccessMask = flush ? 0u : read_bits | write_bits,
+			.dstAccessMask = (isExport || isPresent) ? 0u : read_bits | write_bits,
 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 			.newLayout = isPresent ? GetBackend()->GetPresentLayout() : VK_IMAGE_LAYOUT_GENERAL,
 			.srcQueueFamilyIndex = isExport ? image->queueFamily : state.needsImport ? externalQueue : image->queueFamily,
@@ -4840,7 +4962,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
 		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
-	if ( !pOutputOverride && !scanout->storageImage() && !g_output.compositionScratch )
+	const bool raster = frameInfo->layerCount > 0 && scanout->colorAttachment() && g_device.queueFamily() == g_device.generalQueueFamily() &&
+		!applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 &&
+		!pPipewireTexture && !g_bHDRItmEnable && g_uCompositeDebug == 0 &&
+		(outputTF == EOTF_Count || (outputTF == EOTF_Gamma22 && ToSrgbVulkanFormat(scanout->format()) != scanout->format())) &&
+		std::all_of(frameInfo->layers + 1, frameInfo->layers + frameInfo->layerCount,
+			[](const auto &layer) { return layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
+	if ( !raster && !pOutputOverride && !scanout->storageImage() && !g_output.compositionScratch )
 	{
 		CVulkanTexture::createFlags flags;
 		flags.bStorage = flags.bSampled = flags.bTransferSrc = flags.bTransferDst = true;
@@ -4851,7 +4979,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			return std::nullopt;
 		}
 	}
-	gamescope::Rc<CVulkanTexture> compositeImage = !pOutputOverride && g_output.compositionScratch
+	gamescope::Rc<CVulkanTexture> compositeImage = !raster && !pOutputOverride && g_output.compositionScratch
 		? g_output.compositionScratch.get() : scanout.get();
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
@@ -5073,15 +5201,19 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			const bool simpleBlend = frameInfo->layerCount > 0 && frameInfo->layers[0].opacity == 1.0f &&
 				std::all_of(frameInfo->layers + 1, frameInfo->layers + frameInfo->layerCount,
 					[](const auto &layer) { return layer.opacity == 1.0f && layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
-			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,
-				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, simpleBlend, compositeConfig));
+
 			bind_all_layers(cmdBuffer.get(), frameInfo, compositeConfig.colorMgmtMask >> (k_nMaxLayers + 3 * EOTF_Count));
 			cmdBuffer->bindTarget(compositeImage);
 			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
 
-			const int pixelsPerGroup = 8;
-
-			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
+			if (raster)
+				cmdBuffer->drawComposite(frameInfo, outputTF, compositeConfig);
+			else
+			{
+			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,
+				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, simpleBlend, compositeConfig));
+				cmdBuffer->dispatch(div_roundup(currentOutputWidth, 8), div_roundup(currentOutputHeight, 8));
+			}
 		}
 	}
 

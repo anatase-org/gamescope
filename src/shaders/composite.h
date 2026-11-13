@@ -207,6 +207,15 @@ vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceL
             color = sampleRegular(layerSampler, coord, colorspace);
         }
     }
+#ifdef VKR_FRAGMENT
+    // Fully transparent premultiplied pixels do not touch the tile's color or
+    // require LUT work, provided the color transform preserves transparent black.
+    if (c_drawLayer > 0 && c_colorMgmtMask != 0xffffffffu &&
+        (c_colorMgmtMask & (1u << colorspaceLayerIdx)) == 0 &&
+        (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + 2 * EOTF_Count + colorspace_to_eotf(colorspace)))) != 0 &&
+        all(equal(color, vec4(0.0))))
+        discard;
+#endif
     // JoshA: AMDGPU applies 3x4 CTM like this, where A is 1.0, but it only affects .rgb.
     if ((c_colorMgmtMask & (1u << colorspaceLayerIdx)) != 0)
         color.rgb = vec4(color.rgb, 1.0f) * u_ctm[colorspaceLayerIdx];

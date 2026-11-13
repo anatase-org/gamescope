@@ -63,6 +63,8 @@ else
 endif
 
 shader_src = [
+  'shaders/vs_composite.vert',
+  'shaders/fs_composite.frag',
   'shaders/cs_composite_blit.comp',
   'shaders/cs_composite_blit_rgb10a2.comp',
   'shaders/cs_composite_blur.comp',
