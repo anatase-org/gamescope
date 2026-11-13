@@ -171,6 +171,8 @@ static VkRect2D composite_damage_bounds(const CompositeState_t::Layer &s, wlr_bo
 	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
 }
 
+gamescope::ConVar<bool> cv_raster_linear_read("raster_linear_read", true, "Read compatible linear inputs without a sampled shadow copy.");
+
 #define A_CPU
 #include "shaders/ffx_a.h"
 #include "shaders/ffx_fsr1.h"
@@ -941,7 +943,7 @@ bool CVulkanDevice::createLayouts()
 	for (auto& sampler : ycbcrSamplers)
 		sampler = m_ycbcrSampler;
 
-	std::array<VkDescriptorSetLayoutBinding, 7 > layoutBindings = {
+	std::array<VkDescriptorSetLayoutBinding, 8 > layoutBindings = {
 		VkDescriptorSetLayoutBinding {
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -985,6 +987,10 @@ bool CVulkanDevice::createLayouts()
 			.descriptorCount = VKR_LUT3D_COUNT,
 			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
+		VkDescriptorSetLayoutBinding {
+			.binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
 
 	VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo =
@@ -1001,10 +1007,12 @@ bool CVulkanDevice::createLayouts()
 		return false;
 	}
 
+	VkPushConstantRange linearSourceRange = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 5 * sizeof(uint32_t)};
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = 1,
 		.pSetLayouts = &m_descriptorSetLayout,
+		.pushConstantRangeCount = 1, .pPushConstantRanges = &linearSourceRange,
 	};
 	
 	res = vk.CreatePipelineLayout(device(), &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
@@ -1064,7 +1072,8 @@ bool CVulkanDevice::createPools()
 
 	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
 
-	VkDescriptorPoolSize poolSizes[3] {
+	VkDescriptorPoolSize poolSizes[4] {
+		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(m_descriptorSets.size()) },
 		{
 			VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			uint32_t(m_descriptorSets.size()),
@@ -1078,12 +1087,12 @@ bool CVulkanDevice::createPools()
 			uint32_t(m_descriptorSets.size()) * (((ycbcrProps.combinedImageSamplerDescriptorCount + 1) * VKR_SAMPLER_SLOTS) + (2 * VKR_LUT3D_COUNT)),
 		},
 	};
-	
-	if ( isV3dv() )
+	if ( m_driverID == VK_DRIVER_ID_MESA_V3DV )
 	{
 		// V3DV applies the YCbCr plane stride to unrelated bindings too.
 		for ( auto &poolSize : poolSizes )
 			poolSize.descriptorCount *= 2;
+		vk_log.infof( "V3DV: reserving twice the descriptor pool capacity" );
 	}
 
 	VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {
@@ -1976,18 +1985,19 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	markDirty(m_target);
 }
 
-void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint)
+void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTexture *linearSource)
 {
 	VkDescriptorSet descriptorSet = m_device->descriptorSet();
 	m_descriptorSets.push_back( descriptorSet );
 
-	std::array<VkWriteDescriptorSet, 7> writeDescriptorSets;
+	std::array<VkWriteDescriptorSet, 8> writeDescriptorSets;
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> imageDescriptors = {};
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> ycbcrImageDescriptors = {};
 	std::array<VkDescriptorImageInfo, VKR_TARGET_SLOTS> targetDescriptors = {};
 	std::array<VkDescriptorImageInfo, VKR_LUT3D_COUNT> shaperLutDescriptor = {};
 	std::array<VkDescriptorImageInfo, VKR_LUT3D_COUNT> lut3DDescriptor = {};
 	VkDescriptorBufferInfo scratchDescriptor = {};
+	VkDescriptorBufferInfo linearDescriptor = { linearSource ? linearSource->linearBuffer() : VK_NULL_HANDLE, 0, VK_WHOLE_SIZE };
 
 	writeDescriptorSets[0] = {
 		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -2059,6 +2069,11 @@ void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint)
 		.pImageInfo = lut3DDescriptor.data(),
 	};
 
+	writeDescriptorSets[7] = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = descriptorSet,
+		.dstBinding = 7, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.pBufferInfo = &linearDescriptor,
+	};
 	scratchDescriptor.buffer = m_device->m_uploadBuffer;
 	scratchDescriptor.offset = m_renderBufferOffset;
 	scratchDescriptor.range = m_renderBufferSize;
@@ -2181,6 +2196,26 @@ void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, Co
 			renderDamage = union_rect(renderDamage, composite_layer_bounds(state.layers[i], m_target->width(), m_target->height()));
 		renderDamage = intersect_rect(renderDamage, damage);
 	}
+	std::array<CVulkanTexture *, k_nMaxLayers> linearSources{};
+	for (int i = copyBase ? 1 : 0; i < frame->layerCount; ++i)
+	{
+		auto *tex = m_boundTextures[i];
+		const auto colorspace = frame->layers[i].colorspace;
+		if (cv_raster_linear_read && tex && tex->linearSource && tex->linearSourceDirty &&
+			(config.samplingMask & (1u << (k_nMaxLayers + i))) &&
+			(colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR || colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB))
+		{
+			const auto &current = tex->linearSourceDamage;
+			bool smallDamage = false;
+			if (current.history && current.history == tex->sampledDamage.history)
+				if (auto box = current.history->Between(tex->sampledDamage.sequence, current.sequence))
+					smallDamage = uint64_t(box->width) * box->height < uint64_t(tex->width()) * tex->height() / 4;
+			if (!smallDamage && tex->linearSource->linearBuffer())
+			{
+				linearSources[i] = tex->linearSource.get();
+			}
+		}
+	}
 	if (copyBase)
 		copyImage(frame->layers[0].tex, m_target, damage);
 	if (!renderDamage.extent.width || !renderDamage.extent.height)
@@ -2194,7 +2229,13 @@ void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, Co
 		auto *src = m_boundTextures[i];
 		if (!src)
 			continue;
-		prepareSrcImage(src);
+		if (i < linearSources.size() && linearSources[i])
+		{
+			src->ReferenceReleasePoints(m_releasePointRefs);
+			prepareSrcImage(linearSources[i]);
+		}
+		else
+			prepareSrcImage(src);
 	}
 	// Copies into sampled shadows advance the version during prepareSrcImage.
 	for (int i = 0; i < frame->layerCount; ++i)
@@ -2230,7 +2271,15 @@ void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, Co
 		if (!scissor.extent.width || !scissor.extent.height)
 			continue;
 		config.drawLayer = i;
-
+		config.linearSource = linearSources[i] != nullptr;
+		if (auto *source = linearSources[i])
+		{
+			bindDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, source);
+			const auto &dma = source->dmabuf();
+			const uint32_t data[] = {dma.stride[0] / 4, dma.offset[0] / 4, source->width(), source->height(),
+				uint32_t(source->format() == VK_FORMAT_B8G8R8A8_UNORM) | (uint32_t(!DRMFormatHasAlpha(dma.format)) << 1)};
+			m_device->vk.CmdPushConstants(m_cmdBuffer, m_device->pipelineLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(data), data);
+		}
 		VkPipeline pipeline = m_device->pipeline(SHADER_TYPE_BLIT, frame->layerCount, frame->ycbcrMask(), 0,
 			frame->colorspaceMask(), outputTF, false, false, false, config);
 		m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -2450,6 +2499,7 @@ void CVulkanCmdBuffer::markDirty(CVulkanTexture *image)
 void CVulkanCmdBuffer::insertBarrier(bool flush)
 {
 	std::vector<VkImageMemoryBarrier> barriers;
+	std::vector<VkBufferMemoryBarrier> bufferBarriers;
 
 	uint32_t externalQueue = external_queue_family( m_device );
 
@@ -2491,6 +2541,14 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 			.subresourceRange = subResRange
 		};
 
+		if (image->m_linearBuffer)
+			bufferBarriers.push_back({
+				.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+				.srcAccessMask = 0, .dstAccessMask = isExport ? 0u : VkAccessFlags(VK_ACCESS_SHADER_READ_BIT),
+				.srcQueueFamilyIndex = memoryBarrier.srcQueueFamilyIndex,
+				.dstQueueFamilyIndex = memoryBarrier.dstQueueFamilyIndex,
+				.buffer = image->m_linearBuffer, .offset = 0, .size = VK_WHOLE_SIZE,
+			});
 		barriers.push_back(memoryBarrier);
 		image->queueFamily = memoryBarrier.dstQueueFamilyIndex;
 
@@ -2501,7 +2559,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 
 	// TODO replace VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
 	m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-									0, 0, nullptr, 0, nullptr, barriers.size(), barriers.data());
+									0, 0, nullptr, bufferBarriers.size(), bufferBarriers.data(), barriers.size(), barriers.data());
 }
 
 CVulkanDevice g_device;
@@ -3376,8 +3434,78 @@ CVulkanTexture::CVulkanTexture( void )
 	textureID = ++nextID;
 }
 
+VkBuffer CVulkanTexture::linearBuffer()
+{
+	if (m_linearBufferTried)
+		return m_linearBuffer;
+	m_linearBufferTried = true;
+	if (m_dmabuf.modifier != DRM_FORMAT_MOD_LINEAR || m_dmabuf.n_planes != 1 ||
+		(m_dmabuf.stride[0] % 4) || (m_dmabuf.offset[0] % 4) ||
+		(m_format != VK_FORMAT_R8G8B8A8_UNORM && m_format != VK_FORMAT_B8G8R8A8_UNORM))
+		return VK_NULL_HANDLE;
+	const VkDeviceSize size = VkDeviceSize(m_dmabuf.offset[0]) + VkDeviceSize(m_dmabuf.stride[0]) * (m_height - 1) + VkDeviceSize(m_width) * 4;
+	VkPhysicalDeviceProperties properties;
+	g_device.vk.GetPhysicalDeviceProperties(g_device.physDev(), &properties);
+	if (size > properties.limits.maxStorageBufferRange)
+		return VK_NULL_HANDLE;
+	VkPhysicalDeviceExternalBufferInfo externalInfo = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+		.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+	};
+	VkExternalBufferProperties externalProperties = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+	g_device.vk.GetPhysicalDeviceExternalBufferProperties(g_device.physDev(), &externalInfo, &externalProperties);
+	if (!(externalProperties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT))
+		return VK_NULL_HANDLE;
+	VkExternalMemoryBufferCreateInfo external = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+	};
+	VkBufferCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
+		.size = size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkBuffer buffer = VK_NULL_HANDLE;
+	if (g_device.vk.CreateBuffer(g_device.device(), &info, nullptr, &buffer) != VK_SUCCESS)
+		return VK_NULL_HANDLE;
+	VkMemoryRequirements requirements;
+	g_device.vk.GetBufferMemoryRequirements(g_device.device(), buffer, &requirements);
+	VkMemoryFdPropertiesKHR fdProperties = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	struct stat backing{};
+	int fd = dup(m_dmabuf.fd[0]);
+	if (fd >= 0 && fstat(fd, &backing) == 0 && backing.st_size > 0 &&
+		requirements.size <= VkDeviceSize(backing.st_size) &&
+		g_device.vk.GetMemoryFdPropertiesKHR(g_device.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fdProperties) == VK_SUCCESS)
+	{
+		int type = g_device.findMemoryType(0, requirements.memoryTypeBits & fdProperties.memoryTypeBits);
+		VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buffer};
+		VkImportMemoryFdInfoKHR import = {
+			.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .pNext = &dedicated,
+			.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd,
+		};
+		VkMemoryAllocateInfo allocation = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &import,
+			.allocationSize = requirements.size, .memoryTypeIndex = uint32_t(type),
+		};
+		if (type >= 0 && g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &memory) == VK_SUCCESS)
+			fd = -1; // Vulkan consumed the duplicate.
+	}
+	if (fd >= 0) close(fd);
+	if (memory && g_device.vk.BindBufferMemory(g_device.device(), buffer, memory, 0) == VK_SUCCESS)
+	{
+		m_linearBuffer = buffer;
+		m_linearBufferMemory = memory;
+		return buffer;
+	}
+	g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
+	if (memory) g_device.vk.FreeMemory(g_device.device(), memory, nullptr);
+	return VK_NULL_HANDLE;
+}
+
 CVulkanTexture::~CVulkanTexture( void )
 {
+	if (m_linearBuffer) g_device.vk.DestroyBuffer(g_device.device(), m_linearBuffer, nullptr);
+	if (m_linearBufferMemory) g_device.vk.FreeMemory(g_device.device(), m_linearBufferMemory, nullptr);
 	wlr_dmabuf_attributes_finish( &m_dmabuf );
 
 	if ( m_vkReadbackBuffer != VK_NULL_HANDLE )

@@ -166,6 +166,7 @@ public:
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
+	VkBuffer linearBuffer();
 	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format );
 
 	uint32_t IncRef();
@@ -232,6 +233,10 @@ public:
 	bool blackPreservingLut = false;
 
 private:
+	friend class CVulkanCmdBuffer;
+	VkBuffer m_linearBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_linearBufferMemory = VK_NULL_HANDLE;
+	bool m_linearBufferTried = false;
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
@@ -816,6 +821,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(EnumerateDeviceExtensionProperties) \
 	VK_FUNC(EnumeratePhysicalDevices) \
 	VK_FUNC(GetDeviceProcAddr) \
+	VK_FUNC(GetPhysicalDeviceExternalBufferProperties) \
 	VK_FUNC(GetPhysicalDeviceFeatures2) \
 	VK_FUNC(GetPhysicalDeviceFormatProperties) \
 	VK_FUNC(GetPhysicalDeviceFormatProperties2) \
@@ -1123,7 +1129,7 @@ public:
 	void uploadConstants(Args&&... args);
 	void bindPipeline(VkPipeline pipeline);
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
-	void bindDescriptors(VkPipelineBindPoint bindPoint);
+	void bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTexture *linearSource = nullptr);
 	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> region = std::nullopt);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);

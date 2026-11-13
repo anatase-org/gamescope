@@ -1,3 +1,8 @@
+#ifdef VKR_FRAGMENT
+layout(constant_id = 16) const bool c_linear_source = false;
+layout(binding = 7, std430) readonly buffer LinearPixels { uint u_linearPixels[]; };
+layout(push_constant) uniform LinearSource { uint u_linearStride, u_linearOffset, u_linearWidth, u_linearHeight, u_linearFlags; };
+#endif
 #include "colorimetry.h"
 
 #include "shaderfilter.h"
@@ -173,7 +178,11 @@ vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceL
     vec2 coord = layer_full_screen(offsetLayerIdx) ? uv
         : ((uv + u_offset[offsetLayerIdx]) * u_scale[offsetLayerIdx]);
 
+#ifdef VKR_FRAGMENT
+    vec2 texSize = c_linear_source ? vec2(u_linearWidth, u_linearHeight) : textureSize(layerSampler, 0);
+#else
     vec2 texSize = textureSize(layerSampler, 0);
+#endif
 
     if (!layer_full_screen(offsetLayerIdx) &&
         (coord.x < 0.0f       || coord.y < 0.0f ||
@@ -190,6 +199,16 @@ vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceL
     vec4 color;
     if (layer_aligned(offsetLayerIdx) && unnormalized) {
 
+#ifdef VKR_FRAGMENT
+        if (c_linear_source) {
+            color = unpackUnorm4x8(u_linearPixels[u_linearOffset + uint(coord.y) * u_linearStride + uint(coord.x)]);
+            if ((u_linearFlags & 1u) != 0u) color = color.bgra;
+            if ((u_linearFlags & 2u) != 0u) color.a = 1.0;
+            if (colorspace == colorspace_linear &&
+                (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + 3 * EOTF_Count + colorspaceLayerIdx))) == 0u)
+                color.rgb = colorspace_plane_degamma_tf(color.rgb, colorspace_sRGB);
+        } else
+#endif
         color = texelFetch(layerSampler, ivec2(coord), 0);
         color.rgb = colorspace_plane_degamma_tf(color.rgb, colorspace);
     } else {
