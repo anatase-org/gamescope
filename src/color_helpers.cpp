@@ -725,7 +725,9 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
         glm::mat3 dest_from_xyz = glm::inverse( xyz_from_dest );
 
         glm::mat3 xyz_from_source = normalised_primary_matrix( source.primaries, source.white, 1.f );
-        glm::mat3 dest_from_source = dest_from_xyz * xyz_from_source; // XYZ scaling for white point adjustment
+        // Equal colorimetries need no matrix conversion. Avoid inverse/multiply
+        // roundoff introducing cross-channel color into otherwise separable LUTs.
+        glm::mat3 dest_from_source = source == dest ? glm::mat3(1.f) : dest_from_xyz * xyz_from_source;
 
         // Precalc night mode scalars & digital gain
         // amount and saturation are overdetermined but we separate the two as they conceptually represent
@@ -756,16 +758,23 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
             }
         }
 
-        // Precalculate source color EOTF encoded per-edge.
-        glm::vec3 vSourceColorEOTFEncodedEdge[nLutEdgeSize3d];
+        // Without a look LUT, each source channel has only one value per edge.
+        // Decode those values once, instead of repeating the EOTF for every cell.
+        const bool hasLook = pLook && !pLook->data.empty();
+        // Preserve the evaluation order for luma tone mapping, which can amplify
+        // rounding differences when the PQ decode is moved before the matrix.
+        const bool cacheDecodedEdge = !hasLook && tonemapping.eOperator != ETonemapOperator_EETF2390_Luma;
+        glm::vec3 vSourceColorEdge[nLutEdgeSize3d];
         float flEdgeScale = 1.f / ( (float) nLutEdgeSize3d - 1.f );
         for ( int nIndex = 0; nIndex < nLutEdgeSize3d; ++nIndex )
         {
-            vSourceColorEOTFEncodedEdge[nIndex] = glm::vec3( nIndex * flEdgeScale );
+            vSourceColorEdge[nIndex] = glm::vec3( nIndex * flEdgeScale );
             if ( pShaper )
             {
-                vSourceColorEOTFEncodedEdge[nIndex] = ApplyLut1D_Inverse_Linear( *pShaper, vSourceColorEOTFEncodedEdge[nIndex] );
+                vSourceColorEdge[nIndex] = ApplyLut1D_Inverse_Linear( *pShaper, vSourceColorEdge[nIndex] );
             }
+            if ( cacheDecodedEdge )
+                vSourceColorEdge[nIndex] = calcEOTFToLinear( vSourceColorEdge[nIndex], sourceEOTF, tonemapping );
         }
 
         pLut3d->resize( nLutEdgeSize3d );
@@ -776,15 +785,12 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
             {
                 for ( int nRed=0; nRed<nLutEdgeSize3d; ++nRed )
                 {
-                    glm::vec3 sourceColorEOTFEncoded = glm::vec3( vSourceColorEOTFEncodedEdge[nRed].r, vSourceColorEOTFEncodedEdge[nGreen].g, vSourceColorEOTFEncodedEdge[nBlue].b );
-
-                    if ( pLook && !pLook->data.empty() )
+                    glm::vec3 sourceColorLinear( vSourceColorEdge[nRed].r, vSourceColorEdge[nGreen].g, vSourceColorEdge[nBlue].b );
+                    if ( !cacheDecodedEdge )
                     {
-                        sourceColorEOTFEncoded = ApplyLut3D_Tetrahedral( *pLook, sourceColorEOTFEncoded );
+                        const glm::vec3 encoded = hasLook ? ApplyLut3D_Tetrahedral( *pLook, sourceColorLinear ) : sourceColorLinear;
+                        sourceColorLinear = calcEOTFToLinear( encoded, sourceEOTF, tonemapping );
                     }
-
-                    // Convert to linearized display referred for source colorimetry
-                    glm::vec3 sourceColorLinear = calcEOTFToLinear( sourceColorEOTFEncoded, sourceEOTF, tonemapping );
 
                     // Convert to dest colorimetry (linearized display referred)
                     glm::vec3 destColorLinear = dest_from_source * sourceColorLinear;

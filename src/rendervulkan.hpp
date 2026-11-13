@@ -17,10 +17,12 @@
 #include "gamescope_shared.h"
 #include "backend.h"
 #include "Timeline.h"
+#include "SurfaceDamage.h"
 
 #include "shaders/descriptor_set_constants.h"
 
 class CVulkanCmdBuffer;
+struct CompositeState_t;
 
 // 1: Fade Plane (Fade outs between switching focus)
 // 2: Video Underlay (The actual video)
@@ -164,6 +166,7 @@ public:
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
+	VkBuffer linearBuffer();
 	bool BInitFromSwapchain( VkImage image, uint32_t width, uint32_t height, VkFormat format );
 
 	uint32_t IncRef();
@@ -188,6 +191,9 @@ public:
 	inline const struct wlr_dmabuf_attributes& dmabuf() { return m_dmabuf; }
 	inline VkImage vkImage() { return m_vkImage; }
 	inline bool outputImage() { return m_bOutputImage; }
+	inline bool colorAttachment() const { return m_bColorAttachment; }
+	inline bool storageImage() const { return m_bStorage; }
+	inline VkImageUsageFlags usage() const { return m_usage; }
 	inline bool externalImage() { return m_bExternal; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
@@ -216,11 +222,28 @@ public:
 	~CVulkanTexture( void );
 
 	uint32_t queueFamily = VK_QUEUE_FAMILY_IGNORED;
+	gamescope::OwningRc<CVulkanTexture> linearSource;
+	bool linearSourceDirty = true;
+	SurfaceDamage linearSourceDamage, sampledDamage;
+	uint64_t textureID = 0;
+	std::atomic<uint64_t> contentVersion = {0};
+	std::unique_ptr<CompositeState_t> compositeState;
+	bool identityLut = false;
+	std::vector<uint16_t> uploadedLut;
+	gamescope::Rc<CVulkanTexture> predecodedLut;
+	bool blackPreservingLut = false;
 
 private:
+	friend class CVulkanCmdBuffer;
+	VkBuffer m_linearBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory m_linearBufferMemory = VK_NULL_HANDLE;
+	bool m_linearBufferTried = false;
 	bool m_bInitialized = false;
 	bool m_bExternal = false;
 	bool m_bOutputImage = false;
+	bool m_bColorAttachment = false;
+	bool m_bStorage = false;
+	VkImageUsageFlags m_usage = 0;
 	bool m_bOwnsImage = false;
 
 	uint32_t m_drmFormat = DRM_FORMAT_INVALID;
@@ -314,6 +337,7 @@ struct FrameInfo_t
 	bool frameGenerationActive = false;
 	uint64_t frameGenerationOutputId = 0;
 	bool applyOutputColorMgmt; // drm only
+	bool blendInDisplayEncoding = false; // Mura correction operates on encoded values.
 	EOTF outputEncodingEOTF;
 
 	bool dpms;
@@ -322,6 +346,7 @@ struct FrameInfo_t
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
+		SurfaceDamage damage;
 		int zpos;
 
 		vec2_t offset;
@@ -340,6 +365,8 @@ struct FrameInfo_t
 		std::shared_ptr<gamescope::BackendBlob> ctm;
 		std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
 		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
+		// Borrowed for the duration of a backend Present call.
+		int acquireFenceFd = -1;
 
 		GamescopeAppTextureColorspace colorspace;
 
@@ -373,6 +400,11 @@ struct FrameInfo_t
 			return colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR ||
 				colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB ||
 				colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
+		}
+
+		GamescopeUpscaleFilter shaderFilter() const {
+			return isScreenSize() || ( filter == GamescopeUpscaleFilter::LINEAR && viewConvertsToLinearAutomatically() )
+				? GamescopeUpscaleFilter::FROM_VIEW : filter;
 		}
 
 		uint32_t integerWidth() const { return tex->width() / scale.x; }
@@ -518,7 +550,7 @@ bool acquire_next_image( void );
 bool vulkan_primary_dev_id(dev_t *id);
 bool vulkan_supports_modifiers(void);
 
-gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size);
+gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size, VkFormat format = VK_FORMAT_R16G16B16A16_UNORM);
 gamescope::Rc<CVulkanTexture> vulkan_create_3d_lut(uint32_t width, uint32_t height, uint32_t depth);
 void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamescope::Rc<CVulkanTexture>& lut3d, void* lut1d_data, void* lut3d_data);
 
@@ -627,6 +659,7 @@ struct VulkanOutput_t
 	uint32_t nOutImage; // swapchain index in nested mode, or ping/pong between two RTs
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImages;
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImagesPartialOverlay;
+	gamescope::OwningRc<CVulkanTexture> compositionScratch;
 	gamescope::OwningRc<CVulkanTexture> temporaryHackyBlankImage;
 
 	uint32_t uOutputFormat = DRM_FORMAT_INVALID;
@@ -698,6 +731,22 @@ namespace std
 	};
 }
 
+// UINT32_MAX preserves uniform-driven behavior for shaders outside normal blits.
+struct CompositeShaderConfig_t
+{
+	// Four filter bits per layer, matching BlitPushData_t.
+	uint32_t filterMask = UINT32_MAX;
+	// Layer CTMs followed by the EOTF LUT enables.
+	uint32_t colorMgmtMask = UINT32_MAX;
+	// Full-screen, aligned, and black-border masks, each k_nMaxLayers bits.
+	uint32_t samplingMask = UINT32_MAX;
+	bool opaqueOutput = false;
+	VkFormat renderFormat = VK_FORMAT_UNDEFINED;
+	uint32_t drawLayer = UINT32_MAX;
+	bool linearSource = false;
+	bool operator==( const CompositeShaderConfig_t & ) const = default;
+};
+
 struct PipelineInfo_t
 {
 	ShaderType shaderType;
@@ -712,6 +761,8 @@ struct PipelineInfo_t
 	uint32_t outputEOTF;
 	bool itmEnable;
 	bool fsrSimpleOutput;
+	bool simpleBlend = false;
+	CompositeShaderConfig_t compositeConfig;
 
 	bool operator==(const PipelineInfo_t& o) const {
 		return
@@ -723,7 +774,9 @@ struct PipelineInfo_t
 		colorspaceMask == o.colorspaceMask &&
 		outputEOTF == o.outputEOTF &&
 		itmEnable == o.itmEnable &&
-		fsrSimpleOutput == o.fsrSimpleOutput;
+		fsrSimpleOutput == o.fsrSimpleOutput &&
+		simpleBlend == o.simpleBlend &&
+		compositeConfig == o.compositeConfig;
 	}
 };
 
@@ -748,6 +801,14 @@ namespace std
 			hash = hash_combine(hash, k.outputEOTF);
 			hash = hash_combine(hash, k.itmEnable);
 			hash = hash_combine(hash, k.fsrSimpleOutput);
+			hash = hash_combine(hash, k.simpleBlend);
+			hash = hash_combine(hash, k.compositeConfig.filterMask);
+			hash = hash_combine(hash, k.compositeConfig.colorMgmtMask);
+			hash = hash_combine(hash, k.compositeConfig.samplingMask);
+			hash = hash_combine(hash, k.compositeConfig.opaqueOutput);
+			hash = hash_combine(hash, k.compositeConfig.renderFormat);
+			hash = hash_combine(hash, k.compositeConfig.drawLayer);
+			hash = hash_combine(hash, k.compositeConfig.linearSource);
 			return hash;
 		}
 	};
@@ -763,6 +824,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(EnumerateDeviceExtensionProperties) \
 	VK_FUNC(EnumeratePhysicalDevices) \
 	VK_FUNC(GetDeviceProcAddr) \
+	VK_FUNC(GetPhysicalDeviceExternalBufferProperties) \
 	VK_FUNC(GetPhysicalDeviceFeatures2) \
 	VK_FUNC(GetPhysicalDeviceFormatProperties) \
 	VK_FUNC(GetPhysicalDeviceFormatProperties2) \
@@ -788,6 +850,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdBindDescriptorSets) \
 	VK_FUNC(CmdBindPipeline) \
 	VK_FUNC(CmdClearColorImage) \
+	VK_FUNC(CmdClearAttachments) \
 	VK_FUNC(CmdCopyBufferToImage) \
 	VK_FUNC(CmdCopyImageToBuffer) \
 	VK_FUNC(CmdCopyImage) \
@@ -796,6 +859,8 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdEndRendering) \
 	VK_FUNC(CmdPipelineBarrier) \
 	VK_FUNC(CmdPushConstants) \
+	VK_FUNC(CmdSetViewport) \
+	VK_FUNC(CmdSetScissor) \
 	VK_FUNC(CmdResetQueryPool) \
 	VK_FUNC(CmdWriteTimestamp) \
 	VK_FUNC(CreateBuffer) \
@@ -885,13 +950,14 @@ public:
 	bool BInit(VkInstance instance, VkSurfaceKHR surface);
 
 	VkSampler sampler(SamplerState key);
-	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false);
+	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false, bool simple_blend = false, CompositeShaderConfig_t composite_config = {});
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
 	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
-	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
+	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf, bool completionFence = false);
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
 	bool isComplete(uint64_t sequence);
+	std::optional<int> takeCompletionFence(uint64_t sequence);
 	void waitIdle(bool reset = true);
 	void garbageCollect();
 	VkDescriptorSet descriptorSet();
@@ -904,6 +970,7 @@ public:
 
 	inline VkDevice device() { return m_device; }
 	inline VkPhysicalDevice physDev() {return m_physDev; }
+	inline bool isV3dv() const { return m_driverID == VK_DRIVER_ID_MESA_V3DV; }
 	inline VkInstance instance() { return m_instance; }
 	inline VkQueue queue() {return m_queue;}
 	inline VkQueue generalQueue() {return m_generalQueue;}
@@ -961,7 +1028,7 @@ protected:
 	bool createPools();
 	bool createShaders();
 	bool createScratchResources();
-	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output);
+	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend = false, CompositeShaderConfig_t composite_config = {});
 	void compileAllPipelines();
 
 	VkDevice m_device = nullptr;
@@ -987,6 +1054,7 @@ protected:
 	bool m_bSupportsStorageImageReadWithoutFormat = false;
 	bool m_bSupportsStorageImageWriteWithoutFormat = false;
 	uint32_t m_uVendorID = 0;
+	VkDriverId m_driverID = VK_DRIVER_ID_MAX_ENUM;
 	bool m_bHasDrmPrimaryDevId = false;
 	bool m_bSupportsModifiers = false;
 	bool m_bSupportsClientDmabufs = true;
@@ -994,9 +1062,12 @@ protected:
 
 
 	VkPhysicalDeviceMemoryProperties m_memoryProperties;
+	uint32_t m_uUniformBufferAlignment = 16;
 
 	std::unordered_map< SamplerState, VkSampler > m_samplerCache;
 	std::array<VkShaderModule, SHADER_TYPE_COUNT> m_shaderModules;
+	VkShaderModule m_blitVertex = VK_NULL_HANDLE;
+	VkShaderModule m_blitFragment = VK_NULL_HANDLE;
 	std::unordered_map<PipelineInfo_t, VkPipeline> m_pipelineMap;
 	std::mutex m_pipelineMutex;
 
@@ -1062,13 +1133,14 @@ public:
 	void uploadConstants(Args&&... args);
 	void bindPipeline(VkPipeline pipeline);
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
-	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst);
+	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase);
+	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> region = std::nullopt);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
 
 
 	void prepareSrcImage(CVulkanTexture *image);
-	void prepareDestImage(CVulkanTexture *image);
+	void prepareDestImage(CVulkanTexture *image, bool discard = true);
 	void discardImage(CVulkanTexture *image);
 	void markDirty(CVulkanTexture *image);
 	void insertBarrier(bool flush = false);
@@ -1083,6 +1155,12 @@ public:
 	const std::vector<VulkanTimelinePoint_t> &GetExternalSignals() const { return m_ExternalSignals; }
 
 private:
+	friend class CVulkanDevice;
+	VkSemaphore m_completionSemaphore = VK_NULL_HANDLE;
+	std::optional<int> m_completionFd;
+	bool m_signalCompletion = false;
+	bool m_completionExportFailed = false;
+	void bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTexture *linearSource = nullptr);
 	VkCommandBuffer m_cmdBuffer;
 	CVulkanDevice *m_device;
 
@@ -1108,6 +1186,7 @@ private:
 	std::vector<VkDescriptorSet> m_descriptorSets;
 
 	uint32_t m_renderBufferOffset = 0;
+	uint32_t m_renderBufferSize = 0;
 };
 
 uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride = std::nullopt );

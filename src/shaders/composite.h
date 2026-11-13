@@ -1,7 +1,25 @@
+#ifdef VKR_FRAGMENT
+layout(constant_id = 16) const bool c_linear_source = false;
+layout(binding = 7, std430) readonly buffer LinearPixels { uint u_linearPixels[]; };
+layout(push_constant) uniform LinearSource { uint u_linearStride, u_linearOffset, u_linearWidth, u_linearHeight, u_linearFlags; };
+#endif
 #include "colorimetry.h"
 
 #include "shaderfilter.h"
 #include "alphamode.h"
+
+bool layer_full_screen(uint layerIdx) {
+    return c_samplingMask != 0xffffffffu && (c_samplingMask & (1u << layerIdx)) != 0;
+}
+
+bool layer_aligned(uint layerIdx) {
+    return c_samplingMask != 0xffffffffu && (c_samplingMask & (1u << (layerIdx + VKR_MAX_LAYERS))) != 0;
+}
+
+bool layer_black_border(uint layerIdx) {
+    uint borders = c_samplingMask == 0xffffffffu ? u_borderMask : c_samplingMask >> (2u * VKR_MAX_LAYERS);
+    return (borders & (1u << layerIdx)) != 0;
+}
 
 vec4 sampleRegular(sampler2D tex, vec2 coord, uint colorspace) {
     vec4 color = textureLod(tex, coord, 0);
@@ -75,7 +93,7 @@ void compositing_debug(uvec2 coord) {
 //
 // ie. call colorspace_plane_degamma_tf(color.rgb, colorspace) before
 // input to this function.
-vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace) {
+vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace, bool encodedInput) {
     if (colorspace == colorspace_passthru || colorspace == colorspace_display_native)
         return color;
 
@@ -104,16 +122,35 @@ vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace) {
     //
     // We also need to do degamma here for non-linear views to blend in linear space.
     // ie. PQ -> PQ would need us to manually do bilinear here.
-    bool lut3d_enabled = textureQueryLevels(s_shaperLut[plane_eotf]) != 0;
+    bool lut3d_enabled = c_colorMgmtMask == 0xffffffffu
+        ? textureQueryLevels(s_shaperLut[plane_eotf]) != 0
+        : (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + plane_eotf))) != 0;
     if (lut3d_enabled)
     {
-        color = colorspace_plane_shaper_tf(color, colorspace);
-        color = perform_1dlut(color, s_shaperLut[plane_eotf]);
+        // Compact curves already contain the original LUT and its blend TF at
+        // every 8-bit code. Other sampling geometries keep the original 3D LUT.
+        if (encodedInput && (c_colorMgmtMask & (1u << (2 * VKR_MAX_LAYERS + 3 * EOTF_Count + plane_eotf))) != 0) {
+            // The nearest, unnormalized sampler selects exact 8-bit entries.
+            vec3 coord = color * 255.0 + vec3(0.5, 256.5, 512.5);
+            return vec3(textureLod(s_shaperLut[plane_eotf], coord.r, 0.0).r,
+                        textureLod(s_shaperLut[plane_eotf], coord.g, 0.0).r,
+                        textureLod(s_shaperLut[plane_eotf], coord.b, 0.0).r);
+        }
+        if (!encodedInput)
+            color = colorspace_plane_shaper_tf(color, colorspace);
+        if (c_colorMgmtMask == 0xffffffffu || (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + EOTF_Count + plane_eotf))) == 0)
+            color = perform_1dlut(color, s_shaperLut[plane_eotf]);
+        else
+            color = clamp(color, vec3(0.0), vec3(1.0));
         color = perform_3dlut(color, s_lut3D[plane_eotf]);
         color = colorspace_blend_tf(color, c_output_eotf);
     }
 
     return color;
+}
+
+vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace) {
+    return apply_layer_color_mgmt(color, layer, colorspace, false);
 }
 
 vec4 sampleBilinear(sampler2D tex, vec2 coord, uint colorspace, bool unnormalized) {
@@ -147,11 +184,18 @@ vec4 sampleBilinear(sampler2D tex, vec2 coord, uint colorspace, bool unnormalize
 }
 
 vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceLayerIdx, vec2 uv, bool unnormalized) {
-    vec2 coord = ((uv + u_offset[offsetLayerIdx]) * u_scale[offsetLayerIdx]);
-    vec2 texSize = textureSize(layerSampler, 0);
+    vec2 coord = layer_full_screen(offsetLayerIdx) ? uv
+        : ((uv + u_offset[offsetLayerIdx]) * u_scale[offsetLayerIdx]);
 
-    if (coord.x < 0.0f       || coord.y < 0.0f ||
-        coord.x >= texSize.x || coord.y >= texSize.y) {
+#ifdef VKR_FRAGMENT
+    vec2 texSize = c_linear_source ? vec2(u_linearWidth, u_linearHeight) : textureSize(layerSampler, 0);
+#else
+    vec2 texSize = textureSize(layerSampler, 0);
+#endif
+
+    if (!layer_full_screen(offsetLayerIdx) &&
+        (coord.x < 0.0f       || coord.y < 0.0f ||
+         coord.x >= texSize.x || coord.y >= texSize.y)) {
         float border = (u_borderMask & (1u << offsetLayerIdx)) != 0 ? 1.0f : 0.0f;
 
         if (checkDebugFlag(compositedebug_PlaneBorders))
@@ -160,25 +204,52 @@ vec4 sampleLayerEx(sampler2D layerSampler, uint offsetLayerIdx, uint colorspaceL
         return vec4(0.0f, 0.0f, 0.0f, border);
     }
 
-    if (!unnormalized)
-        coord /= texSize;
-
     uint colorspace = get_layer_colorspace(colorspaceLayerIdx);
     vec4 color;
-    if (get_layer_shaderfilter(offsetLayerIdx) == filter_pixel) {
-        vec2 output_res = texSize / u_scale[offsetLayerIdx];
-        vec2 extent = max((texSize / output_res), vec2(1.0 / 256.0));
-        color = sampleBandLimited(layerSampler, coord, unnormalized ? vec2(1.0f) : texSize, unnormalized ? vec2(1.0f) : vec2(1.0f) / texSize, extent, colorspace, unnormalized);
+    if (layer_aligned(offsetLayerIdx) && unnormalized) {
+
+#ifdef VKR_FRAGMENT
+        if (c_linear_source) {
+            color = unpackUnorm4x8(u_linearPixels[u_linearOffset + uint(coord.y) * u_linearStride + uint(coord.x)]);
+            if ((u_linearFlags & 1u) != 0u) color = color.bgra;
+            if ((u_linearFlags & 2u) != 0u) color.a = 1.0;
+            if (colorspace == colorspace_linear &&
+                (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + 3 * EOTF_Count + colorspaceLayerIdx))) == 0u)
+                color.rgb = colorspace_plane_degamma_tf(color.rgb, colorspace_sRGB);
+        } else
+#endif
+        color = texelFetch(layerSampler, ivec2(coord), 0);
+        color.rgb = colorspace_plane_degamma_tf(color.rgb, colorspace);
+    } else {
+        if (!unnormalized)
+            coord /= texSize;
+        if (get_layer_shaderfilter(offsetLayerIdx) == filter_pixel) {
+            vec2 output_res = texSize / u_scale[offsetLayerIdx];
+            vec2 extent = max((texSize / output_res), vec2(1.0 / 256.0));
+            color = sampleBandLimited(layerSampler, coord, unnormalized ? vec2(1.0f) : texSize, unnormalized ? vec2(1.0f) : vec2(1.0f) / texSize, extent, colorspace, unnormalized);
+        }
+        else if (get_layer_shaderfilter(offsetLayerIdx) == filter_linear_emulated) {
+            color = sampleBilinear(layerSampler, coord, colorspace, unnormalized);
+        }
+        else {
+            color = sampleRegular(layerSampler, coord, colorspace);
+        }
     }
-    else if (get_layer_shaderfilter(offsetLayerIdx) == filter_linear_emulated) {
-        color = sampleBilinear(layerSampler, coord, colorspace, unnormalized);
-    }
-    else {
-        color = sampleRegular(layerSampler, coord, colorspace);
-    }
+#ifdef VKR_FRAGMENT
+    // Fully transparent premultiplied pixels do not touch the tile's color or
+    // require LUT work, provided the color transform preserves transparent black.
+    if (c_drawLayer > 0 && c_colorMgmtMask != 0xffffffffu &&
+        (c_colorMgmtMask & (1u << colorspaceLayerIdx)) == 0 &&
+        (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + 2 * EOTF_Count + colorspace_to_eotf(colorspace)))) != 0 &&
+        all(equal(color, vec4(0.0))))
+        discard;
+#endif
     // JoshA: AMDGPU applies 3x4 CTM like this, where A is 1.0, but it only affects .rgb.
-    color.rgb = vec4(color.rgb, 1.0f) * u_ctm[colorspaceLayerIdx];
-    color.rgb = apply_layer_color_mgmt(color.rgb, offsetLayerIdx, colorspace);
+    if ((c_colorMgmtMask & (1u << colorspaceLayerIdx)) != 0)
+        color.rgb = vec4(color.rgb, 1.0f) * u_ctm[colorspaceLayerIdx];
+    bool encodedInput = c_colorMgmtMask != 0xffffffffu &&
+        (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + 3 * EOTF_Count + colorspaceLayerIdx))) != 0;
+    color.rgb = apply_layer_color_mgmt(color.rgb, offsetLayerIdx, colorspace, encodedInput);
 
     return color;
 }

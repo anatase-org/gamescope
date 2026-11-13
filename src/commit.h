@@ -41,6 +41,7 @@ struct commit_t final : public gamescope::RcObject, public gamescope::IWaitable,
 
 	struct wlr_buffer *buf = nullptr;
 	gamescope::Rc<CVulkanTexture> vulkanTex;
+	SurfaceDamage damage;
 	std::shared_ptr<gamescope::CReleaseTimelinePoint> releasePoint;
 	std::optional<UpscaledTexture_t> upscaledTexture;
 

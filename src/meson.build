@@ -51,18 +51,20 @@ if run_command(glsl_compiler, ['--version', '--depfile', 'dummy.dep'], check: fa
   glsl_generator = generator(
     glsl_compiler,
     output    : ['@BASENAME@.h'],
-    arguments : ['-V', '@INPUT@', '--vn', '@BASENAME@', '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', '--quiet'],
+    arguments : ['-V', '-Os', '@INPUT@', '--vn', '@BASENAME@', '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', '--quiet'],
     depfile   : '@BASENAME@.h.d',
   )
 else
   glsl_generator = generator(
     glsl_compiler,
     output    : ['@BASENAME@.h'],
-    arguments : ['-V', '@INPUT@', '--vn', '@BASENAME@', '-o', '@OUTPUT@'],
+    arguments : ['-V', '-Os', '@INPUT@', '--vn', '@BASENAME@', '-o', '@OUTPUT@'],
   )
 endif
 
 shader_src = [
+  'shaders/vs_composite.vert',
+  'shaders/fs_composite.frag',
   'shaders/cs_composite_blit.comp',
   'shaders/cs_composite_blit_rgb10a2.comp',
   'shaders/cs_composite_blur.comp',

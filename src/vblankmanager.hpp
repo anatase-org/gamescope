@@ -67,6 +67,7 @@ namespace gamescope
 
         uint64_t m_ulTargetVBlank = 0;
         std::atomic<uint64_t> m_ulLastVBlank = { 0 };
+        std::atomic<uint64_t> m_ulLastProcessedVBlank = { 0 };
         std::atomic<bool> m_bArmed = { false };
         std::atomic<bool> m_bRunning = { true };
 

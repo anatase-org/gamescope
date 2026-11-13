@@ -12,6 +12,7 @@
 #include <deque>
 #include <thread>
 #include <dlfcn.h>
+#include <glm/gtc/packing.hpp>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
 
@@ -43,6 +44,8 @@
 #include "Utils/Process.h"
 
 #include "cs_composite_blit.h"
+#include "vs_composite.h"
+#include "fs_composite.h"
 #include "cs_composite_blit_rgb10a2.h"
 #include "cs_composite_blur.h"
 #include "cs_composite_blur_cond.h"
@@ -60,11 +63,123 @@
 #include "cs_rgb_to_nv12.h"
 #include "cs_rotation.h"
 
+gamescope::ConVar<bool> cv_raster_damage("raster_damage", true, "Reuse input shadows and output contents outside client damage.");
+
+gamescope::ConVar<bool> cv_raster_linear_read("raster_linear_read", true, "Read compatible linear inputs without a sampled shadow copy.");
+
+struct CompositeState_t
+{
+	struct Layer
+	{
+		uint64_t texture = 0, version = 0;
+		SurfaceDamage damage;
+		std::array<float, 5> geometry{}; // scale, pixel-center offset, opacity
+		std::array<uint32_t, 2> size{};
+		std::array<uint32_t, 6> flags{}; // colorspace, filter, alpha mode, black border, format, applied color management
+		std::array<float, 12> ctm{};
+		bool operator==(const Layer &) const = default;
+	};
+	std::array<Layer, k_nMaxLayers> layers{};
+	std::array<uint64_t, EOTF_Count * 4> luts{};
+	CompositeShaderConfig_t config;
+	EOTF outputTF;
+	int layerCount;
+};
+
+static CompositeState_t composite_state(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config)
+{
+	CompositeState_t state{};
+	state.config = config;
+	state.outputTF = outputTF;
+	state.layerCount = frame->layerCount;
+	for (int i = 0; i < frame->layerCount; ++i)
+	{
+		const auto &layer = frame->layers[i];
+		auto &s = state.layers[i];
+		s.texture = layer.tex->textureID;
+		s.version = layer.tex->contentVersion.load(std::memory_order_relaxed);
+		if (layer.damage.texture == s.texture)
+			s.damage = layer.damage;
+		const auto offset = layer.offsetPixelCenter();
+		s.geometry = {layer.scale.x, layer.scale.y, offset.x, offset.y, layer.opacity};
+		s.size = {layer.tex->width(), layer.tex->height()};
+		s.flags = {uint32_t(layer.colorspace), uint32_t(layer.filter), uint32_t(layer.eAlphaBlendingMode), uint32_t(layer.blackBorder), uint32_t(layer.tex->format()), uint32_t(layer.outputColorMgmtApplied)};
+		if (layer.ctm)
+		{
+			const auto &matrix = layer.ctm->View<glm::mat3x4>();
+			memcpy(s.ctm.data(), &matrix, sizeof(matrix));
+		}
+	}
+	for (int i = 0; i < EOTF_Count; ++i)
+	{
+		if (frame->shaperLut[i])
+		{
+			state.luts[4 * i] = frame->shaperLut[i]->textureID;
+			state.luts[4 * i + 1] = frame->shaperLut[i]->contentVersion.load(std::memory_order_relaxed);
+		}
+		if (frame->lut3D[i])
+		{
+			state.luts[4 * i + 2] = frame->lut3D[i]->textureID;
+			state.luts[4 * i + 3] = frame->lut3D[i]->contentVersion.load(std::memory_order_relaxed);
+		}
+	}
+	return state;
+}
+
+static VkRect2D composite_layer_bounds(const CompositeState_t::Layer &s, uint32_t width, uint32_t height)
+{
+	if (s.flags[3])
+		return {{0, 0}, {width, height}};
+	const float x = float(s.size[0]) / s.geometry[0], y = float(s.size[1]) / s.geometry[1];
+	const int left = std::clamp(int(floorf(std::min(0.0f, x) - s.geometry[2])), 0, int(width));
+	const int top = std::clamp(int(floorf(std::min(0.0f, y) - s.geometry[3])), 0, int(height));
+	const int right = std::clamp(int(ceilf(std::max(0.0f, x) - s.geometry[2])) + 1, left, int(width));
+	const int bottom = std::clamp(int(ceilf(std::max(0.0f, y) - s.geometry[3])) + 1, top, int(height));
+	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+}
+
+static VkRect2D intersect_rect(VkRect2D a, VkRect2D b)
+{
+	const int x = std::max(a.offset.x, b.offset.x), y = std::max(a.offset.y, b.offset.y);
+	const int right = std::min(a.offset.x + int(a.extent.width), b.offset.x + int(b.extent.width));
+	const int bottom = std::min(a.offset.y + int(a.extent.height), b.offset.y + int(b.extent.height));
+	return {{x, y}, {uint32_t(std::max(0, right - x)), uint32_t(std::max(0, bottom - y))}};
+}
+
+static VkRect2D union_rect(VkRect2D a, VkRect2D b)
+{
+	if (!a.extent.width || !a.extent.height) return b;
+	if (!b.extent.width || !b.extent.height) return a;
+	const int x = std::min(a.offset.x, b.offset.x), y = std::min(a.offset.y, b.offset.y);
+	const int right = std::max(a.offset.x + int(a.extent.width), b.offset.x + int(b.extent.width));
+	const int bottom = std::max(a.offset.y + int(a.extent.height), b.offset.y + int(b.extent.height));
+	return {{x, y}, {uint32_t(right - x), uint32_t(bottom - y)}};
+}
+
+static VkRect2D composite_damage_bounds(const CompositeState_t::Layer &s, wlr_box damage, uint32_t width, uint32_t height)
+{
+	if (damage.width <= 0 || damage.height <= 0)
+		return {};
+	// Include filtering footprints and fractional output positions. The normal
+	// raster path excludes wider reconstruction filters and rotations.
+	const float x1 = (damage.x - 1.0f) / s.geometry[0] - s.geometry[2];
+	const float x2 = (damage.x + damage.width + 1.0f) / s.geometry[0] - s.geometry[2];
+	const float y1 = (damage.y - 1.0f) / s.geometry[1] - s.geometry[3];
+	const float y2 = (damage.y + damage.height + 1.0f) / s.geometry[1] - s.geometry[3];
+	const int left = std::clamp(int(floorf(std::min(x1, x2))), 0, int(width));
+	const int top = std::clamp(int(floorf(std::min(y1, y2))), 0, int(height));
+	const int right = std::clamp(int(ceilf(std::max(x1, x2))) + 1, left, int(width));
+	const int bottom = std::clamp(int(ceilf(std::max(y1, y2))) + 1, top, int(height));
+	return {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+}
+
 #define A_CPU
 #include "shaders/ffx_a.h"
 #include "shaders/ffx_fsr1.h"
 
 #include "reshade_effect_manager.hpp"
+
+ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
 extern bool g_bWasPartialComposite;
 extern bool g_bAllowDeferredBackend;
@@ -329,8 +444,11 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 
 	m_bInitialized = true;
 
-	std::thread piplelineThread([this](){compileAllPipelines();});
-	piplelineThread.detach();
+	if ( !isV3dv() )
+	{
+		std::thread piplelineThread([this](){compileAllPipelines();});
+		piplelineThread.detach();
+	}
 
 	g_reshadeManager.init(this);
 
@@ -422,7 +540,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 					vk_log.infof("Intel device detected, forcing general queue family instead of compute-only queue");
 					m_queueFamily = generalIndex;
 				}
-				else if ( env_to_bool( getenv( "GAMESCOPE_FORCE_GENERAL_QUEUE" ) ) )
+				else if ( GetBackend()->UsesBackendAllocatedScanout() || env_to_bool( getenv( "GAMESCOPE_FORCE_GENERAL_QUEUE" ) ) )
 					m_queueFamily = generalIndex;
 			}
 		}
@@ -444,6 +562,8 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 	vk.GetPhysicalDeviceProperties2( m_physDev, &props2 );
 	const VkPhysicalDeviceProperties &props = props2.properties;
 	m_uVendorID = props.vendorID;
+	m_uUniformBufferAlignment = std::max<uint32_t>(16, props.limits.minUniformBufferOffsetAlignment);
+	m_driverID = driverProps.driverID;
 	vk_log.infof( "selecting physical device '%s': queue family %x (general queue family %x)", props.deviceName, m_queueFamily, m_generalQueueFamily );
 
 	// Venus currently aborts when importing DMA-BUFs from the guest's virtio-gpu
@@ -823,49 +943,53 @@ bool CVulkanDevice::createLayouts()
 	for (auto& sampler : ycbcrSamplers)
 		sampler = m_ycbcrSampler;
 
-	std::array<VkDescriptorSetLayoutBinding, 7 > layoutBindings = {
+	std::array<VkDescriptorSetLayoutBinding, 8 > layoutBindings = {
 		VkDescriptorSetLayoutBinding {
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 1,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 2,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 3,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_SAMPLER_SLOTS,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 4,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_SAMPLER_SLOTS,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 			.pImmutableSamplers = ycbcrSamplers.data(),
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 5,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_LUT3D_COUNT,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 		VkDescriptorSetLayoutBinding {
 			.binding = 6,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = VKR_LUT3D_COUNT,
-			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		VkDescriptorSetLayoutBinding {
+			.binding = 7, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
 
@@ -883,10 +1007,12 @@ bool CVulkanDevice::createLayouts()
 		return false;
 	}
 
+	VkPushConstantRange linearSourceRange = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 5 * sizeof(uint32_t)};
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = 1,
 		.pSetLayouts = &m_descriptorSetLayout,
+		.pushConstantRangeCount = 1, .pPushConstantRanges = &linearSourceRange,
 	};
 	
 	res = vk.CreatePipelineLayout(device(), &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
@@ -946,7 +1072,8 @@ bool CVulkanDevice::createPools()
 
 	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
 
-	VkDescriptorPoolSize poolSizes[3] {
+	VkDescriptorPoolSize poolSizes[4] {
+		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(m_descriptorSets.size()) },
 		{
 			VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			uint32_t(m_descriptorSets.size()),
@@ -960,6 +1087,13 @@ bool CVulkanDevice::createPools()
 			uint32_t(m_descriptorSets.size()) * (((ycbcrProps.combinedImageSamplerDescriptorCount + 1) * VKR_SAMPLER_SLOTS) + (2 * VKR_LUT3D_COUNT)),
 		},
 	};
+	if ( m_driverID == VK_DRIVER_ID_MESA_V3DV )
+	{
+		// V3DV applies the YCbCr plane stride to unrelated bindings too.
+		for ( auto &poolSize : poolSizes )
+			poolSize.descriptorCount *= 2;
+		vk_log.infof( "V3DV: reserving twice the descriptor pool capacity" );
+	}
 	
 	VkDescriptorPoolCreateInfo descriptorPoolCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1030,6 +1164,14 @@ bool CVulkanDevice::createShaders()
 		}
 	}
 
+	for ( auto [words, size, module] : { std::tuple{ vs_composite, sizeof(vs_composite), &m_blitVertex },
+	                                  std::tuple{ fs_composite, sizeof(fs_composite), &m_blitFragment } } )
+	{
+		VkShaderModuleCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = words };
+		if ( vk.CreateShaderModule(device(), &info, nullptr, module) != VK_SUCCESS )
+			return false;
+	}
+
 	return true;
 }
 
@@ -1098,16 +1240,11 @@ bool CVulkanDevice::createScratchResources()
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
 		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
 	};
-
-	VkSemaphoreCreateInfo semCreateInfo = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-		.pNext = &timelineCreateInfo,
-	};
-
-	res = vk.CreateSemaphore( device(), &semCreateInfo, NULL, &m_scratchTimelineSemaphore );
-	if ( res != VK_SUCCESS )
+	VkSemaphoreCreateInfo semCreateInfo = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &timelineCreateInfo };
+	res = vk.CreateSemaphore(device(), &semCreateInfo, nullptr, &m_scratchTimelineSemaphore);
+	if (res != VK_SUCCESS)
 	{
-		vk_errorf( res, "vkCreateSemaphore failed" );
+		vk_errorf(res, "vkCreateSemaphore failed");
 		return false;
 	}
 
@@ -1139,9 +1276,9 @@ VkSampler CVulkanDevice::sampler( SamplerState key )
 	return ret;
 }
 
-VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output)
+VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend, CompositeShaderConfig_t composite_config)
 {
-	const std::array<VkSpecializationMapEntry, 8> specializationEntries = {{
+	const std::array<VkSpecializationMapEntry, 17> specializationEntries = {{
 		{
 			.constantID = 0,
 			.offset     = sizeof(uint32_t) * 0,
@@ -1184,6 +1321,15 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 			.offset     = sizeof(uint32_t) * 7,
 			.size       = sizeof(uint32_t)
 		},
+		{ .constantID = 8, .offset = sizeof(uint32_t) * 8, .size = sizeof(uint32_t) },
+		{ .constantID = 9, .offset = sizeof(uint32_t) * 9, .size = sizeof(uint32_t) },
+		{ .constantID = 10, .offset = sizeof(uint32_t) * 10, .size = sizeof(uint32_t) },
+		{ .constantID = 11, .offset = sizeof(uint32_t) * 11, .size = sizeof(uint32_t) },
+		{ .constantID = 12, .offset = sizeof(uint32_t) * 12, .size = sizeof(uint32_t) },
+		{ .constantID = 13, .offset = sizeof(uint32_t) * 13, .size = sizeof(uint32_t) },
+		{ .constantID = 14, .offset = sizeof(uint32_t) * 14, .size = sizeof(uint32_t) },
+		{ .constantID = 15, .offset = sizeof(uint32_t) * 15, .size = sizeof(uint32_t) },
+		{ .constantID = 16, .offset = sizeof(uint32_t) * 16, .size = sizeof(uint32_t) },
 	}};
 
 	struct {
@@ -1195,6 +1341,15 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		uint32_t output_eotf;
 		uint32_t fsr_simple_output;
 		uint32_t itm_enable;
+		uint32_t workgroup_x;
+		uint32_t workgroup_y;
+		uint32_t simple_blend;
+		uint32_t filter_mask;
+		uint32_t color_mgmt_mask;
+		uint32_t sampling_mask;
+		uint32_t opaque_output;
+		uint32_t draw_layer;
+		uint32_t linear_source;
 	} specializationData = {
 		.layerCount   = layerCount,
 		.ycbcrMask    = ycbcrMask,
@@ -1204,6 +1359,15 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.output_eotf = output_eotf,
 		.fsr_simple_output = fsr_simple_output,
 		.itm_enable = itm_enable,
+		.workgroup_x = fsr_simple_output && isV3dv() ? 256u : 8u,
+		.workgroup_y = fsr_simple_output && isV3dv() ? 1u : 8u,
+		.simple_blend = simple_blend,
+		.filter_mask = composite_config.filterMask,
+		.color_mgmt_mask = composite_config.colorMgmtMask,
+		.sampling_mask = composite_config.samplingMask,
+		.opaque_output = composite_config.opaqueOutput,
+		.draw_layer = composite_config.drawLayer,
+		.linear_source = composite_config.linearSource,
 	};
 
 	VkSpecializationInfo specializationInfo = {
@@ -1212,6 +1376,58 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.dataSize      = sizeof(specializationData),
 		.pData		   = &specializationData,
 	};
+
+	if ( composite_config.renderFormat != VK_FORMAT_UNDEFINED )
+	{
+		if (composite_config.drawLayer == 0)
+			vk_log.debugf("Raster pipeline: %u layers, colorspace %#x, filters %#x, color management %#x, sampling %#x, target %u",
+				layerCount, colorspace_mask, composite_config.filterMask, composite_config.colorMgmtMask, composite_config.samplingMask, composite_config.renderFormat);
+
+		VkPipelineShaderStageCreateInfo stages[] = {
+			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			  .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = m_blitVertex, .pName = "main" },
+			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			  .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = m_blitFragment, .pName = "main",
+			  .pSpecializationInfo = &specializationInfo },
+		};
+		VkPipelineVertexInputStateCreateInfo vertex = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+		VkPipelineInputAssemblyStateCreateInfo assembly = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+		VkPipelineViewportStateCreateInfo viewport = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+		VkPipelineRasterizationStateCreateInfo raster = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+			.polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+		VkPipelineMultisampleStateCreateInfo samples = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+		VkPipelineColorBlendAttachmentState blend = {
+			.blendEnable = composite_config.drawLayer != 0,
+			.srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			.colorBlendOp = VK_BLEND_OP_ADD,
+			.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+			.alphaBlendOp = VK_BLEND_OP_ADD,
+			.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+		};
+		VkPipelineColorBlendStateCreateInfo blending = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blend };
+		VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+		VkPipelineDynamicStateCreateInfo dynamic = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dynamicStates };
+		VkPipelineRenderingCreateInfo rendering = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+			.colorAttachmentCount = 1, .pColorAttachmentFormats = &composite_config.renderFormat };
+		VkGraphicsPipelineCreateInfo info = {
+			.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering,
+			.stageCount = 2, .pStages = stages, .pVertexInputState = &vertex, .pInputAssemblyState = &assembly,
+			.pViewportState = &viewport, .pRasterizationState = &raster, .pMultisampleState = &samples,
+			.pColorBlendState = &blending, .pDynamicState = &dynamic, .layout = m_pipelineLayout,
+		};
+		VkPipeline result = VK_NULL_HANDLE;
+		VkResult res = vk.CreateGraphicsPipelines(device(), VK_NULL_HANDLE, 1, &info, nullptr, &result);
+		if (res != VK_SUCCESS)
+			vk_errorf(res, "vkCreateGraphicsPipelines failed");
+		return result;
+	}
 
 	VkComputePipelineCreateInfo computePipelineCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -1283,18 +1499,18 @@ void CVulkanDevice::compileAllPipelines()
 
 extern bool g_bSteamIsActiveWindow;
 
-VkPipeline CVulkanDevice::pipeline(ShaderType type, uint32_t layerCount, uint32_t ycbcrMask, uint32_t blur_layers, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output)
+VkPipeline CVulkanDevice::pipeline(ShaderType type, uint32_t layerCount, uint32_t ycbcrMask, uint32_t blur_layers, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend, CompositeShaderConfig_t composite_config)
 {
 	uint32_t effective_debug = g_uCompositeDebug;
 	if ( g_bSteamIsActiveWindow )
 		effective_debug &= ~(CompositeDebugFlag::Heatmap | CompositeDebugFlag::Heatmap_MSWCG | CompositeDebugFlag::Heatmap_Hard);
 
 	std::lock_guard<std::mutex> lock(m_pipelineMutex);
-	PipelineInfo_t key = {type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output};
+	PipelineInfo_t key = {type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output, simple_blend, composite_config};
 	auto search = m_pipelineMap.find(key);
 	if (search == m_pipelineMap.end())
 	{
-		VkPipeline result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output);
+		VkPipeline result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output, simple_blend, composite_config);
 		m_pipelineMap[key] = result;
 		return result;
 	}
@@ -1372,6 +1588,12 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 
 	pSignalSemaphores.push_back( m_scratchTimelineSemaphore );
 	ulSignalPoints.push_back( nextSeqNo );
+	if (cmdBuffer->m_signalCompletion)
+	{
+		pSignalSemaphores.push_back(cmdBuffer->m_completionSemaphore);
+		ulSignalPoints.push_back(0); // Binary semaphore; timeline value is ignored.
+	}
+
 
 	for ( auto &dep : cmdBuffer->GetExternalSignals() )
 	{
@@ -1383,7 +1605,8 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pWaitSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
 		ulWaitPoints.push_back( dep.ulPoint );
-		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT );
+		// Client buffers can first be read by a transfer into a sampled shadow.
+		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_ALL_COMMANDS_BIT );
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
@@ -1414,9 +1637,38 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	return nextSeqNo;
 }
 
-uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
+uint64_t CVulkanDevice::submit(std::unique_ptr<CVulkanCmdBuffer> cmdBuffer, bool completionFence)
 {
+	if (completionFence && !cmdBuffer->m_completionSemaphore)
+	{
+		VkExportSemaphoreCreateInfo external = {
+			.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+			.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
+		VkSemaphoreCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &external };
+		if (vk.CreateSemaphore(device(), &info, nullptr, &cmdBuffer->m_completionSemaphore) != VK_SUCCESS)
+			vk_log.warnf("Completion sync-file semaphore unavailable; using CPU synchronization");
+	}
+	cmdBuffer->m_signalCompletion = completionFence && cmdBuffer->m_completionSemaphore;
 	uint64_t nextSeqNo = submitInternal(cmdBuffer.get());
+	if (cmdBuffer->m_signalCompletion)
+	{
+		VkSemaphoreGetFdInfoKHR info = {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+			.semaphore = cmdBuffer->m_completionSemaphore,
+			.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
+		int fd = -1;
+		VkResult res = vk.GetSemaphoreFdKHR(device(), &info, &fd);
+		if (res == VK_SUCCESS)
+			cmdBuffer->m_completionFd = fd; // -1 is a valid, already-signaled sync file.
+		else
+		{
+			vk_errorf(res, "Failed to export composition completion fence");
+			cmdBuffer->m_completionFd.reset();
+			cmdBuffer->m_completionExportFailed = true;
+		}
+	}
 	m_pendingCmdBufs.emplace(nextSeqNo, std::move(cmdBuffer));
 	return nextSeqNo;
 }
@@ -1453,6 +1705,12 @@ void CVulkanDevice::garbageCollect( void )
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 
 	resetCmdBuffers(currentSeqNo);
+}
+
+std::optional<int> CVulkanDevice::takeCompletionFence(uint64_t sequence)
+{
+	auto it = m_pendingCmdBufs.find(sequence);
+	return it == m_pendingCmdBufs.end() ? std::nullopt : std::exchange(it->second->m_completionFd, std::nullopt);
 }
 
 VulkanTimelineSemaphore_t::~VulkanTimelineSemaphore_t()
@@ -1621,19 +1879,13 @@ void CVulkanDevice::waitIdle(bool reset)
 
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
-	auto last = m_pendingCmdBufs.find(sequence);
-	if (last == m_pendingCmdBufs.end())
-		return;
-
-	for (auto it = m_pendingCmdBufs.begin(); ; it++)
+	auto end = m_pendingCmdBufs.upper_bound(sequence);
+	for (auto it = m_pendingCmdBufs.begin(); it != end; ++it)
 	{
 		it->second->reset();
 		m_unusedCmdBufs.push_back(std::move(it->second));
-		if (it == last)
-			break;
 	}
-
-	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), ++last);
+	m_pendingCmdBufs.erase(m_pendingCmdBufs.begin(), end);
 }
 
 CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuffer, VkQueue queue, uint32_t queueFamily)
@@ -1643,12 +1895,26 @@ CVulkanCmdBuffer::CVulkanCmdBuffer(CVulkanDevice *parent, VkCommandBuffer cmdBuf
 
 CVulkanCmdBuffer::~CVulkanCmdBuffer()
 {
+	if (m_completionFd && *m_completionFd >= 0)
+		close(*m_completionFd);
+	if (m_completionSemaphore)
+		m_device->vk.DestroySemaphore(m_device->device(), m_completionSemaphore, nullptr);
 	m_device->recycleDescriptorSets( m_descriptorSets );
 	m_device->vk.FreeCommandBuffers(m_device->device(), m_device->commandPool(), 1, &m_cmdBuffer);
 }
 
 void CVulkanCmdBuffer::reset()
 {
+	if (m_completionFd && *m_completionFd >= 0)
+		close(*m_completionFd);
+	if (m_completionExportFailed)
+	{
+		m_device->vk.DestroySemaphore(m_device->device(), m_completionSemaphore, nullptr);
+		m_completionSemaphore = VK_NULL_HANDLE;
+		m_completionExportFailed = false;
+	}
+	m_completionFd.reset();
+	m_signalCompletion = false;
 	vk_check( m_device->vk.ResetCommandBuffer(m_cmdBuffer, 0) );
 	m_device->recycleDescriptorSets( m_descriptorSets );
 	m_textureRefs.clear();
@@ -1734,8 +2000,9 @@ void CVulkanCmdBuffer::uploadConstants(Args&&... args)
 {
 	PushData data(std::forward<Args>(args)...);
 
-	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data));
+	auto [ptr, offset] = m_device->uploadBufferData(sizeof(data), m_device->m_uUniformBufferAlignment);
 	m_renderBufferOffset = offset;
+	m_renderBufferSize = sizeof(data);
 	memcpy(ptr, &data, sizeof(data));
 }
 
@@ -1755,16 +2022,24 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	prepareDestImage(m_target);
 	insertBarrier();
 
+	bindDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE);
+	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
+	markDirty(m_target);
+}
+
+void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTexture *linearSource)
+{
 	VkDescriptorSet descriptorSet = m_device->descriptorSet();
 	m_descriptorSets.push_back( descriptorSet );
 
-	std::array<VkWriteDescriptorSet, 7> writeDescriptorSets;
+	std::array<VkWriteDescriptorSet, 8> writeDescriptorSets;
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> imageDescriptors = {};
 	std::array<VkDescriptorImageInfo, VKR_SAMPLER_SLOTS> ycbcrImageDescriptors = {};
 	std::array<VkDescriptorImageInfo, VKR_TARGET_SLOTS> targetDescriptors = {};
 	std::array<VkDescriptorImageInfo, VKR_LUT3D_COUNT> shaperLutDescriptor = {};
 	std::array<VkDescriptorImageInfo, VKR_LUT3D_COUNT> lut3DDescriptor = {};
 	VkDescriptorBufferInfo scratchDescriptor = {};
+	VkDescriptorBufferInfo linearDescriptor = { linearSource ? linearSource->linearBuffer() : VK_NULL_HANDLE, 0, VK_WHOLE_SIZE };
 
 	writeDescriptorSets[0] = {
 		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1836,9 +2111,14 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		.pImageInfo = lut3DDescriptor.data(),
 	};
 
+	writeDescriptorSets[7] = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = descriptorSet,
+		.dstBinding = 7, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.pBufferInfo = &linearDescriptor,
+	};
 	scratchDescriptor.buffer = m_device->m_uploadBuffer;
 	scratchDescriptor.offset = m_renderBufferOffset;
-	scratchDescriptor.range = VK_WHOLE_SIZE;
+	scratchDescriptor.range = m_renderBufferSize;
 
 	for (uint32_t i = 0; i < VKR_SAMPLER_SLOTS; i++)
 	{
@@ -1865,18 +2145,28 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 		nearestState.bNearest = true;
 		nearestState.bUnnormalized = false;
 
-		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
-		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		SamplerState shaperState = linearState;
+		if (m_shaperLut[i] && m_shaperLut[i]->format() == VK_FORMAT_R16_SFLOAT)
+		{
+			shaperState.bNearest = true;
+			shaperState.bUnnormalized = true;
+		}
+		shaperLutDescriptor[i].sampler = m_device->sampler(shaperState);
+		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
 		// I need to change this, it's so utterly stupid and confusing.
 		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
 
 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
-		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
 	}
 
-	if (!m_target->isYcbcr())
+	if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+	{
+		// Fragment shaders do not use the storage-image bindings.
+	}
+	else if (!m_target->isYcbcr())
 	{
 		targetDescriptors[0].imageView = m_target->srgbView();
 		targetDescriptors[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1892,19 +2182,179 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 
 	m_device->vk.UpdateDescriptorSets(m_device->device(), writeDescriptorSets.size(), writeDescriptorSets.data(), 0, nullptr);
 
-	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+	m_device->vk.CmdBindDescriptorSets(m_cmdBuffer, bindPoint, m_device->pipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
 
-	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
-
-	markDirty(m_target);
 }
 
-void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst)
+void CVulkanCmdBuffer::drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase)
+{
+	const bool cacheable = cv_raster_damage && kDisablePartialComposition && m_target->outputImage() &&
+		!GetBackend()->UsesVulkanSwapchain() && !frame->frameGenerationActive && !g_pLastReshadeEffect;
+	auto state = composite_state(frame, outputTF, config);
+	const auto *previous = cacheable ? m_target->compositeState.get() : nullptr;
+	VkRect2D damage = {{0, 0}, {m_target->width(), m_target->height()}};
+	if (previous && previous->layerCount == state.layerCount && previous->outputTF == state.outputTF &&
+		previous->config == state.config && previous->luts == state.luts)
+	{
+		int left = m_target->width(), top = m_target->height(), right = 0, bottom = 0;
+		for (int i = 0; i < state.layerCount; ++i)
+		{
+			if (previous->layers[i] == state.layers[i])
+				continue;
+			const auto &old = previous->layers[i], &current = state.layers[i];
+			if (old.damage.history && old.damage.history == current.damage.history &&
+				old.geometry == current.geometry && old.size == current.size && old.flags == current.flags && old.ctm == current.ctm &&
+				frame->layers[i].shaderFilter() != GamescopeUpscaleFilter::PIXEL)
+			{
+				if (auto changed = current.damage.history->Between(old.damage.sequence, current.damage.sequence))
+				{
+					auto r = composite_damage_bounds(current, *changed, m_target->width(), m_target->height());
+					if (r.extent.width && r.extent.height)
+					{
+						left = std::min(left, r.offset.x); top = std::min(top, r.offset.y);
+						right = std::max(right, r.offset.x + int(r.extent.width));
+						bottom = std::max(bottom, r.offset.y + int(r.extent.height));
+					}
+					continue;
+				}
+			}
+			for (const auto *layer : std::array<const CompositeState_t::Layer *, 2>{&previous->layers[i], &state.layers[i]})
+			{
+				const auto r = composite_layer_bounds(*layer, m_target->width(), m_target->height());
+				left = std::min(left, r.offset.x); top = std::min(top, r.offset.y);
+				right = std::max(right, r.offset.x + int(r.extent.width));
+				bottom = std::max(bottom, r.offset.y + int(r.extent.height));
+			}
+		}
+		if (right <= left || bottom <= top)
+		{
+			m_target->compositeState = std::make_unique<CompositeState_t>(std::move(state));
+			return;
+		}
+		damage = {{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+	}
+
+	const bool preserve = previous && (damage.offset.x != 0 || damage.offset.y != 0 ||
+		damage.extent.width != m_target->width() || damage.extent.height != m_target->height());
+	VkRect2D renderDamage = damage;
+	if (copyBase)
+	{
+		renderDamage = {};
+		for (int i = 1; i < state.layerCount; ++i)
+			renderDamage = union_rect(renderDamage, composite_layer_bounds(state.layers[i], m_target->width(), m_target->height()));
+		renderDamage = intersect_rect(renderDamage, damage);
+	}
+	std::array<CVulkanTexture *, k_nMaxLayers> linearSources{};
+	for (int i = copyBase ? 1 : 0; i < frame->layerCount; ++i)
+	{
+		auto *tex = m_boundTextures[i];
+		const auto colorspace = frame->layers[i].colorspace;
+		if (cv_raster_linear_read && tex && tex->linearSource && tex->linearSourceDirty &&
+			(config.samplingMask & (1u << (k_nMaxLayers + i))) &&
+			(colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR || colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB))
+		{
+			const auto &current = tex->linearSourceDamage;
+			bool smallDamage = false;
+			if (current.history && current.history == tex->sampledDamage.history)
+				if (auto box = current.history->Between(tex->sampledDamage.sequence, current.sequence))
+					smallDamage = uint64_t(box->width) * box->height < uint64_t(tex->width()) * tex->height() / 4;
+			if (!smallDamage && tex->linearSource->linearBuffer())
+			{
+				linearSources[i] = tex->linearSource.get();
+			}
+		}
+	}
+	if (copyBase)
+		copyImage(frame->layers[0].tex, m_target, damage);
+	if (!renderDamage.extent.width || !renderDamage.extent.height)
+	{
+		if (cacheable)
+			m_target->compositeState = std::make_unique<CompositeState_t>(std::move(state));
+		return;
+	}
+	for (uint32_t i = copyBase ? 1 : 0; i < m_boundTextures.size(); ++i)
+	{
+		auto *src = m_boundTextures[i];
+		if (!src)
+			continue;
+		if (i < linearSources.size() && linearSources[i])
+		{
+			src->ReferenceReleasePoints(m_releasePointRefs);
+			prepareSrcImage(linearSources[i]);
+		}
+		else
+			prepareSrcImage(src);
+	}
+	// Copies into sampled shadows advance the version during prepareSrcImage.
+	for (int i = 0; i < frame->layerCount; ++i)
+		state.layers[i].version = frame->layers[i].tex->contentVersion.load(std::memory_order_relaxed);
+	prepareDestImage(m_target, !preserve);
+	insertBarrier();
+	bindDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+	VkRenderingAttachmentInfo attachment = {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = outputTF == EOTF_Gamma22 ? m_target->linearView() : m_target->srgbView(),
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.loadOp = preserve || copyBase ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	};
+	VkRenderingInfo rendering = {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = renderDamage, .layerCount = 1,
+		.colorAttachmentCount = 1, .pColorAttachments = &attachment,
+	};
+	m_device->vk.CmdBeginRendering(m_cmdBuffer, &rendering);
+	if (preserve && !copyBase)
+	{
+		VkClearAttachment clear = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0 };
+		VkClearRect rect = { .rect = damage, .baseArrayLayer = 0, .layerCount = 1 };
+		m_device->vk.CmdClearAttachments(m_cmdBuffer, 1, &clear, 1, &rect);
+	}
+	VkViewport viewport = { 0.0f, 0.0f, float(m_target->width()), float(m_target->height()), 0.0f, 1.0f };
+	m_device->vk.CmdSetViewport(m_cmdBuffer, 0, 1, &viewport);
+	config.renderFormat = outputTF == EOTF_Gamma22 ? ToSrgbVulkanFormat(m_target->format()) : m_target->format();
+	for (int i = copyBase ? 1 : 0; i < frame->layerCount; ++i)
+	{
+		VkRect2D scissor = intersect_rect(composite_layer_bounds(state.layers[i], m_target->width(), m_target->height()), renderDamage);
+		if (!scissor.extent.width || !scissor.extent.height)
+			continue;
+		config.drawLayer = i;
+		config.linearSource = linearSources[i] != nullptr;
+		if (auto *source = linearSources[i])
+		{
+			bindDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, source);
+			const auto &dma = source->dmabuf();
+			const uint32_t data[] = {dma.stride[0] / 4, dma.offset[0] / 4, source->width(), source->height(),
+				uint32_t(source->format() == VK_FORMAT_B8G8R8A8_UNORM) | (uint32_t(!DRMFormatHasAlpha(dma.format)) << 1)};
+			m_device->vk.CmdPushConstants(m_cmdBuffer, m_device->pipelineLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(data), data);
+		}
+		VkPipeline pipeline = m_device->pipeline(SHADER_TYPE_BLIT, frame->layerCount, frame->ycbcrMask(), 0,
+			frame->colorspaceMask(), outputTF, false, false, false, config);
+		m_device->vk.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		m_device->vk.CmdSetScissor(m_cmdBuffer, 0, 1, &scissor);
+		m_device->vk.CmdDraw(m_cmdBuffer, 3, 1, 0, 0);
+	}
+	m_device->vk.CmdEndRendering(m_cmdBuffer);
+	markDirty(m_target);
+	if (cacheable)
+		m_target->compositeState = std::make_unique<CompositeState_t>(std::move(state));
+}
+
+void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> rect)
 {
 	assert(src->width() == dst->width());
 	assert(src->height() == dst->height());
+	if (src->linearSource && src->linearSourceDirty)
+	{
+		// A raw copy can read the producer directly, without first refreshing the
+		// sampled shadow. Retain its explicit release point until this copy ends.
+		src->ReferenceReleasePoints(m_releasePointRefs);
+		m_textureRefs.emplace_back(src);
+		src = src->linearSource;
+	}
 	prepareSrcImage(src.get());
-	prepareDestImage(dst.get());
+	prepareDestImage(dst.get(), !rect || (rect->offset.x == 0 && rect->offset.y == 0 &&
+		rect->extent.width == dst->width() && rect->extent.height == dst->height()));
 	insertBarrier();
 
 	VkImageCopy region = {
@@ -1912,13 +2362,15 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.layerCount = 1
 		},
+		.srcOffset = {rect ? rect->offset.x : 0, rect ? rect->offset.y : 0, 0},
 		.dstSubresource = {
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.layerCount = 1
 		},
+		.dstOffset = {rect ? rect->offset.x : 0, rect ? rect->offset.y : 0, 0},
 		.extent = {
-			.width = src->width(),
-			.height = src->height(),
+			.width = rect ? rect->extent.width : src->width(),
+			.height = rect ? rect->extent.height : src->height(),
 			.depth = 1
 		},
 	};
@@ -2026,6 +2478,28 @@ static uint32_t external_queue_family( CVulkanDevice *device )
 
 void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 {
+	if ( image->linearSource && image->linearSourceDirty && !m_textureState.contains( image ) )
+	{
+		std::optional<VkRect2D> region;
+		const auto &current = image->linearSourceDamage;
+		if (cv_raster_damage && current.history && current.history == image->sampledDamage.history)
+		{
+			if (auto damage = current.history->Between(image->sampledDamage.sequence, current.sequence))
+			{
+				const int left = std::clamp(damage->x, 0, int(image->width()));
+				const int top = std::clamp(damage->y, 0, int(image->height()));
+				const int right = std::clamp(damage->x + damage->width, left, int(image->width()));
+				const int bottom = std::clamp(damage->y + damage->height, top, int(image->height()));
+				region = VkRect2D{{left, top}, {uint32_t(right - left), uint32_t(bottom - top)}};
+			}
+		}
+		// Each client buffer has its own shadow. Accumulate surface damage since
+		// that shadow was sampled, including commits that used other buffers.
+		if (!region || (region->extent.width && region->extent.height))
+			copyImage(image->linearSource, image, region);
+		image->sampledDamage = current;
+		image->linearSourceDirty = false;
+	}
 	auto result = m_textureState.emplace(image, TextureState());
 	// no need to reimport if the image didn't change
 	if (!result.second)
@@ -2038,14 +2512,14 @@ void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 	result.first->second.needsExport = image->externalImage();
 }
 
-void CVulkanCmdBuffer::prepareDestImage(CVulkanTexture *image)
+void CVulkanCmdBuffer::prepareDestImage(CVulkanTexture *image, bool discard)
 {
 	auto result = m_textureState.emplace(image, TextureState());
 	// no need to discard if the image is already image/in the correct layout
 	if (!result.second)
 		return;
 	image->ReferenceReleasePoints( m_releasePointRefs );
-	result.first->second.discarded = true;
+	result.first->second.discarded = discard;
 	result.first->second.needsImport =
 		image->queueFamily == external_queue_family( m_device );
 	result.first->second.needsExport = image->externalImage();
@@ -2062,6 +2536,8 @@ void CVulkanCmdBuffer::discardImage(CVulkanTexture *image)
 
 void CVulkanCmdBuffer::markDirty(CVulkanTexture *image)
 {
+	++image->contentVersion;
+	image->compositeState.reset();
 	auto result = m_textureState.find(image);
 	// image should have been prepared already
 	assert(result !=  m_textureState.end());
@@ -2071,6 +2547,7 @@ void CVulkanCmdBuffer::markDirty(CVulkanTexture *image)
 void CVulkanCmdBuffer::insertBarrier(bool flush)
 {
 	std::vector<VkImageMemoryBarrier> barriers;
+	std::vector<VkBufferMemoryBarrier> bufferBarriers;
 
 	uint32_t externalQueue = external_queue_family( m_device );
 
@@ -2093,8 +2570,8 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		if (!state.discarded && !state.dirty && !state.needsImport && !isExport && !isPresent)
 			continue;
 
-		const VkAccessFlags write_bits = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		const VkAccessFlags write_bits = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		const VkAccessFlags read_bits = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
 
 		if (image->queueFamily == VK_QUEUE_FAMILY_IGNORED)
 			image->queueFamily = m_queueFamily;
@@ -2103,7 +2580,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 		{
 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask = state.dirty ? write_bits : 0u,
-			.dstAccessMask = flush ? 0u : read_bits | write_bits,
+			.dstAccessMask = (isExport || isPresent) ? 0u : read_bits | write_bits,
 			.oldLayout = state.discarded ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 			.newLayout = isPresent ? GetBackend()->GetPresentLayout() : VK_IMAGE_LAYOUT_GENERAL,
 			.srcQueueFamilyIndex = isExport ? image->queueFamily : state.needsImport ? externalQueue : image->queueFamily,
@@ -2112,6 +2589,14 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 			.subresourceRange = subResRange
 		};
 
+		if (image->m_linearBuffer)
+			bufferBarriers.push_back({
+				.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+				.srcAccessMask = 0, .dstAccessMask = isExport ? 0u : VkAccessFlags(VK_ACCESS_SHADER_READ_BIT),
+				.srcQueueFamilyIndex = memoryBarrier.srcQueueFamilyIndex,
+				.dstQueueFamilyIndex = memoryBarrier.dstQueueFamilyIndex,
+				.buffer = image->m_linearBuffer, .offset = 0, .size = VK_WHOLE_SIZE,
+			});
 		barriers.push_back(memoryBarrier);
 		image->queueFamily = memoryBarrier.dstQueueFamilyIndex;
 
@@ -2122,7 +2607,7 @@ void CVulkanCmdBuffer::insertBarrier(bool flush)
 
 	// TODO replace VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
 	m_device->vk.CmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-									0, 0, nullptr, 0, nullptr, barriers.size(), barriers.data());
+									0, 0, nullptr, bufferBarriers.size(), bufferBarriers.data(), barriers.size(), barriers.data());
 }
 
 CVulkanDevice g_device;
@@ -2209,7 +2694,13 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 {
 	m_pBackendFb = std::move( pBackendFb );
 	m_drmFormat = drmFormat;
+	m_bColorAttachment = flags.bColorAttachment;
+	m_bStorage = flags.bStorage;
 	VkResult res = VK_ERROR_INITIALIZATION_FAILED;
+	// Forced composition only scans out backend-allocated outputs. Sampled
+	// intermediates and client uploads need no separate KMS allocation.
+	if ( GetBackend()->UsesBackendAllocatedScanout() && flags.bSampled && !flags.bOutputImage )
+		flags.bFlippable = false;
 
 	VkImageTiling tiling = (flags.bMappable || flags.bLinear) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
 	VkImageUsageFlags usage = 0;
@@ -2249,6 +2740,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 	{
 		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	}
+	m_usage = usage;
 
 	if ( flags.bMappable == true )
 	{
@@ -2478,7 +2970,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		VkMemoryDedicatedAllocateInfo memory_dedicated_info = {};
 		struct wsi_memory_allocate_info memory_wsi_info = {};
 
-		if ( flags.bFlippable == true )
+		if ( flags.bFlippable == true && !( pDMA && g_device.isV3dv() ) )
 		{
 			memory_wsi_info = {
 				.sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
@@ -2579,7 +3071,6 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		vk_errorf( res, "vkBindImageMemory failed" );
 		return false;
 	}
-
 	if ( flags.bMappable == true )
 	{
 		assert( tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT );
@@ -2704,7 +3195,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		m_dmabuf = dmabuf;
 	}
-	else if ( pDMA != nullptr && flags.bFlippable == true )
+	else if ( pDMA != nullptr && (flags.bFlippable || (flags.bTransferSrc && !flags.bSampled)) )
 	{
 		m_dmabuf = *pDMA;
 		m_dmabuf.n_planes = 0;
@@ -2727,7 +3218,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 	}
 
-	bool bHasAlpha = ( pDMA && !flags.bOutputImage ) ? DRMFormatHasAlpha( pDMA->format ) : true;
+	bool bHasAlpha = !flags.bOutputImage && !flags.bStorage ? DRMFormatHasAlpha(drmFormat) : true;
 
 	if (!bHasAlpha )
 	{
@@ -2761,7 +3252,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 		}
 
-		if ( flags.bSampled )
+		if ( flags.bSampled || flags.bColorAttachment )
 		{
 			VkImageViewUsageCreateInfo viewUsageInfo = {
 				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
@@ -2985,10 +3476,84 @@ bool CVulkanTexture::IsInUse()
 
 CVulkanTexture::CVulkanTexture( void )
 {
+	static std::atomic<uint64_t> nextID = {0};
+	textureID = ++nextID;
+}
+
+// Import a read-only alias only when a transfer-only RGB input can avoid its
+// sampled-shadow copy. Filtering and failed imports retain the existing path.
+VkBuffer CVulkanTexture::linearBuffer()
+{
+	if (m_linearBufferTried)
+		return m_linearBuffer;
+	m_linearBufferTried = true;
+	if (m_dmabuf.modifier != DRM_FORMAT_MOD_LINEAR || m_dmabuf.n_planes != 1 ||
+		(m_dmabuf.stride[0] % 4) || (m_dmabuf.offset[0] % 4) ||
+		(m_format != VK_FORMAT_R8G8B8A8_UNORM && m_format != VK_FORMAT_B8G8R8A8_UNORM))
+		return VK_NULL_HANDLE;
+	const VkDeviceSize size = VkDeviceSize(m_dmabuf.offset[0]) + VkDeviceSize(m_dmabuf.stride[0]) * (m_height - 1) + VkDeviceSize(m_width) * 4;
+	VkPhysicalDeviceProperties properties;
+	g_device.vk.GetPhysicalDeviceProperties(g_device.physDev(), &properties);
+	if (size > properties.limits.maxStorageBufferRange)
+		return VK_NULL_HANDLE;
+	VkPhysicalDeviceExternalBufferInfo externalInfo = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+		.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+	};
+	VkExternalBufferProperties externalProperties = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+	g_device.vk.GetPhysicalDeviceExternalBufferProperties(g_device.physDev(), &externalInfo, &externalProperties);
+	if (!(externalProperties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT))
+		return VK_NULL_HANDLE;
+	VkExternalMemoryBufferCreateInfo external = {
+		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+	};
+	VkBufferCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
+		.size = size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkBuffer buffer = VK_NULL_HANDLE;
+	if (g_device.vk.CreateBuffer(g_device.device(), &info, nullptr, &buffer) != VK_SUCCESS)
+		return VK_NULL_HANDLE;
+	VkMemoryRequirements requirements;
+	g_device.vk.GetBufferMemoryRequirements(g_device.device(), buffer, &requirements);
+	VkMemoryFdPropertiesKHR fdProperties = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	struct stat backing{};
+	int fd = dup(m_dmabuf.fd[0]);
+	if (fd >= 0 && fstat(fd, &backing) == 0 && backing.st_size > 0 &&
+		requirements.size <= VkDeviceSize(backing.st_size) &&
+		g_device.vk.GetMemoryFdPropertiesKHR(g_device.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fdProperties) == VK_SUCCESS)
+	{
+		int type = g_device.findMemoryType(0, requirements.memoryTypeBits & fdProperties.memoryTypeBits);
+		VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buffer};
+		VkImportMemoryFdInfoKHR import = {
+			.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .pNext = &dedicated,
+			.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd,
+		};
+		VkMemoryAllocateInfo allocation = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &import,
+			.allocationSize = requirements.size, .memoryTypeIndex = uint32_t(type),
+		};
+		if (type >= 0 && g_device.vk.AllocateMemory(g_device.device(), &allocation, nullptr, &memory) == VK_SUCCESS)
+			fd = -1; // Vulkan consumed the duplicate.
+	}
+	if (fd >= 0) close(fd);
+	if (memory && g_device.vk.BindBufferMemory(g_device.device(), buffer, memory, 0) == VK_SUCCESS)
+	{
+		m_linearBuffer = buffer;
+		m_linearBufferMemory = memory;
+		return buffer;
+	}
+	g_device.vk.DestroyBuffer(g_device.device(), buffer, nullptr);
+	if (memory) g_device.vk.FreeMemory(g_device.device(), memory, nullptr);
+	return VK_NULL_HANDLE;
 }
 
 CVulkanTexture::~CVulkanTexture( void )
 {
+	if (m_linearBuffer) g_device.vk.DestroyBuffer(g_device.device(), m_linearBuffer, nullptr);
+	if (m_linearBufferMemory) g_device.vk.FreeMemory(g_device.device(), m_linearBufferMemory, nullptr);
 	wlr_dmabuf_attributes_finish( &m_dmabuf );
 
 	if ( m_vkReadbackBuffer != VK_NULL_HANDLE )
@@ -3132,6 +3697,12 @@ static bool is_image_format_modifier_supported(VkFormat format, uint32_t drmForm
   };
 
   VkResult res = g_device.vk.GetPhysicalDeviceImageFormatProperties2( g_device.physDev(), &imageFormatInfo, &imageFormatProps );
+  if (res == VK_ERROR_FORMAT_NOT_SUPPORTED && drmFormat != DRM_FORMAT_NV12)
+  {
+    // Import transfer-only RGB modifiers through the sampled shadow on any GPU.
+    imageFormatInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    res = g_device.vk.GetPhysicalDeviceImageFormatProperties2( g_device.physDev(), &imageFormatInfo, &imageFormatProps );
+  }
   return res == VK_SUCCESS;
 }
 
@@ -3216,13 +3787,17 @@ bool vulkan_init_format(VkFormat format, uint32_t drmFormat)
 			if ( !is_image_format_modifier_supported( format, drmFormat, modifier ) )
 				continue;
 
-			if ( ( modifierProps[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ) == 0 )
+			const VkFormatFeatureFlags requiredFeature = drmFormat != DRM_FORMAT_NV12 &&
+				!(modifierProps[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+				? VK_FORMAT_FEATURE_TRANSFER_SRC_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+			if ( ( modifierProps[j].drmFormatModifierTilingFeatures & requiredFeature ) == 0 )
 			{
 				continue;
 			}
 
-			// The deferred backend exposes all sample-able formats as supported modifiers.
-			if ( !g_bAllowDeferredBackend )
+			// Composed clients need sampler-compatible modifiers, not KMS-compatible
+			// ones. Backend-allocated scanout already forces their composition.
+			if ( !g_bAllowDeferredBackend && !GetBackend()->UsesBackendAllocatedScanout() )
 			{
 				if ( GetBackend()->UsesModifiers() && !gamescope::Algorithm::Contains( GetBackend()->GetSupportedModifiers( drmFormat ), modifier ) )
 					continue;
@@ -3400,7 +3975,7 @@ void vulkan_present_to_window( uint64_t frameGenerationOutputId )
 		vulkan_remake_swapchain();
 }
 
-gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size)
+gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size, VkFormat format)
 {
 	CVulkanTexture::createFlags flags;
 	flags.bSampled = true;
@@ -3408,7 +3983,7 @@ gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size)
 	flags.imageType = VK_IMAGE_TYPE_1D;
 
 	auto texture = new CVulkanTexture();
-	auto drmFormat = VulkanFormatToDRM( VK_FORMAT_R16G16B16A16_UNORM );
+	auto drmFormat = VulkanFormatToDRM( format );
 	bool bRes = texture->BInit( size, 1u, 1u, drmFormat, flags );
 	assert( bRes );
 
@@ -3432,21 +4007,98 @@ gamescope::Rc<CVulkanTexture> vulkan_create_3d_lut(uint32_t width, uint32_t heig
 
 void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamescope::Rc<CVulkanTexture>& lut3d, void* lut1d_data, void* lut3d_data)
 {
-	size_t lut1d_size = lut1d->width() * sizeof(uint16_t) * 4;
-	size_t lut3d_size = lut3d->width() * lut3d->height() * lut3d->depth() * sizeof(uint16_t) * 4;
+	const size_t lut1d_size = lut1d->width() * sizeof(uint16_t) * 4;
+	const size_t lut3d_size = size_t(lut3d->width()) * lut3d->height() * lut3d->depth() * sizeof(uint16_t) * 4;
+	const auto unchanged = [](const auto &texture, const void *data, size_t size) {
+		return texture->uploadedLut.size() * sizeof(uint16_t) == size && !memcmp(texture->uploadedLut.data(), data, size);
+	};
+	const bool changed1d = !unchanged(lut1d, lut1d_data, lut1d_size);
+	const bool changed3d = !unchanged(lut3d, lut3d_data, lut3d_size);
+	if (!changed1d && !changed3d)
+		return;
+	lut1d->uploadedLut.assign(static_cast<uint16_t *>(lut1d_data), static_cast<uint16_t *>(lut1d_data) + lut1d_size / sizeof(uint16_t));
+	lut3d->uploadedLut.assign(static_cast<uint16_t *>(lut3d_data), static_cast<uint16_t *>(lut3d_data) + lut3d_size / sizeof(uint16_t));
 
-	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size);
+	// Recognize identity tables once, at upload, including explicitly supplied LUTs.
+	// One 16-bit quantization step accounts for roundoff in generated matrices.
+	const auto identityValue = [](uint16_t value, uint32_t coordinate, uint32_t size) {
+		return size > 1 && std::abs(int(value) - int(std::lround(65535.0 * coordinate / (size - 1)))) <= 1;
+	};
+	const auto *one = static_cast<const uint16_t *>(lut1d_data);
+	lut1d->identityLut = lut1d->width() > 1;
+	for (uint32_t x = 0; x < lut1d->width() && lut1d->identityLut; ++x)
+		for (uint32_t c = 0; c < 3; ++c)
+			lut1d->identityLut &= identityValue(one[4 * x + c], x, lut1d->width());
+	const auto *three = static_cast<const uint16_t *>(lut3d_data);
+	lut1d->blackPreservingLut = one[0] == 0 && one[1] == 0 && one[2] == 0;
+	lut3d->blackPreservingLut = three[0] == 0 && three[1] == 0 && three[2] == 0;
+	lut3d->identityLut = lut3d->width() > 1 && lut3d->height() > 1 && lut3d->depth() > 1;
+	for (uint32_t z = 0; z < lut3d->depth() && lut3d->identityLut; ++z)
+		for (uint32_t y = 0; y < lut3d->height() && lut3d->identityLut; ++y)
+			for (uint32_t x = 0; x < lut3d->width() && lut3d->identityLut; ++x)
+			{
+				const size_t p = 4 * (x + lut3d->width() * (y + lut3d->height() * z));
+				lut3d->identityLut &= identityValue(three[p], x, lut3d->width()) &&
+					identityValue(three[p + 1], y, lut3d->height()) && identityValue(three[p + 2], z, lut3d->depth());
+			}
+
+	// A separable 3D LUT is three independent curves. For aligned 8-bit SDR
+	// samples, tabulate every possible input value, including blend linearization.
+	// This preserves the LUT instead of dropping night mode or changing filtering.
+	std::optional<std::array<uint16_t, 256 * 3>> predecoded;
+	const std::array<uint32_t, 3> sizes{lut3d->width(), lut3d->height(), lut3d->depth()};
+	const std::array<size_t, 3> strides{1, sizes[0], size_t(sizes[0]) * sizes[1]};
+	bool separable = lut1d->identityLut && !lut3d->identityLut &&
+		std::all_of(sizes.begin(), sizes.end(), [](auto size) { return size > 1; });
+	for (uint32_t z = 0; z < sizes[2] && separable; ++z)
+		for (uint32_t y = 0; y < sizes[1] && separable; ++y)
+			for (uint32_t x = 0; x < sizes[0] && separable; ++x)
+			{
+				const size_t p = 4 * (x + sizes[0] * (y + sizes[1] * z));
+				const std::array<uint32_t, 3> coordinates{x, y, z};
+				for (uint32_t c = 0; c < 3; ++c)
+					separable &= std::abs(int(three[p + c]) - int(three[4 * strides[c] * coordinates[c] + c])) <= 1;
+			}
+	if (separable)
+	{
+		predecoded.emplace();
+		for (uint32_t x = 0; x < 256; ++x)
+			for (uint32_t c = 0; c < 3; ++c)
+			{
+				const double p = double(x) * (sizes[c] - 1) / 255.0;
+				const uint32_t lo = uint32_t(p), hi = std::min(lo + 1, sizes[c] - 1);
+				const double a = three[4 * strides[c] * lo + c] / 65535.0;
+				const double b = three[4 * strides[c] * hi + c] / 65535.0;
+				const double encoded = a + (b - a) * (p - lo);
+				const double linear = encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4);
+				(*predecoded)[256 * c + x] = glm::packHalf1x16(float(linear));
+			}
+		if (!lut3d->predecodedLut)
+			lut3d->predecodedLut = vulkan_create_1d_lut(256 * 3, VK_FORMAT_R16_SFLOAT);
+		lut3d->predecodedLut->blackPreservingLut = lut3d->blackPreservingLut;
+	}
+	else
+		lut3d->predecodedLut = nullptr;
+	const size_t predecodedSize = predecoded ? sizeof(*predecoded) : 0;
+	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size + predecodedSize);
 
 	void* lut1d_dst = base_dst;
 	void *lut3d_dst = ((uint8_t*)base_dst) + lut1d_size;
 	memcpy(lut1d_dst, lut1d_data, lut1d_size);
 	memcpy(lut3d_dst, lut3d_data, lut3d_size);
+	if (predecoded)
+		memcpy(static_cast<uint8_t *>(base_dst) + lut1d_size + lut3d_size, predecoded->data(), predecodedSize);
 
 	auto cmdBuffer = g_device.commandBuffer();
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
+	if (changed1d)
+		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
+	if (changed3d)
+		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
+	if (predecoded)
+		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size + lut3d_size, 0, lut3d->predecodedLut);
+	// Subsequent draws use the same queue and the command-buffer barriers make
+	// these writes visible. The upload arena waits before reusing its storage.
 	g_device.submit(std::move(cmdBuffer));
-	g_device.waitIdle(); // TODO: Sync this better
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_get_hacky_blank_texture()
@@ -3645,6 +4297,8 @@ static std::vector<uint64_t> vulkan_get_backend_scanout_modifiers( VulkanOutput_
 
 	for ( uint64_t ulModifier : GetBackend()->GetSupportedModifiers( pOutput->uOutputFormat ) )
 	{
+		if ( g_device.isV3dv() && ulModifier != DRM_FORMAT_MOD_LINEAR )
+			continue;
 		if ( ulModifier == DRM_FORMAT_MOD_INVALID )
 			continue;
 		if ( bHasOverlay &&
@@ -3654,6 +4308,21 @@ static std::vector<uint64_t> vulkan_get_backend_scanout_modifiers( VulkanOutput_
 	}
 
 	return modifiers;
+}
+
+// GBM placement and Vulkan image usage are separate capabilities. In particular,
+// linear scanout can be a color attachment without supporting storage or sampling.
+static bool dmabuf_supports_usage(uint32_t format, uint64_t modifier, VkImageUsageFlags usage)
+{
+	VkImageCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D, .format = DRMFormatToVulkan(format, false),
+		.extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VkExternalImageFormatProperties external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+	return getModifierProps(&info, modifier, &external) == VK_SUCCESS &&
+		(external.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
 }
 
 static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
@@ -3672,10 +4341,24 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 			uWidth, uHeight, pOutput->uOutputFormat, modifiers, &dmabuf ) )
 			return false;
 
+		auto flags = outputImageflags;
+		const VkImageUsageFlags attachmentUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		if (!dmabuf_supports_usage(pOutput->uOutputFormat, dmabuf.modifier,
+			attachmentUsage | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+		{
+			flags.bStorage = false;
+			flags.bSampled = false;
+			if (!dmabuf_supports_usage(pOutput->uOutputFormat, dmabuf.modifier, attachmentUsage))
+			{
+				wlr_dmabuf_attributes_finish(&dmabuf);
+				return false;
+			}
+		}
+
 		pOutput->outputImages[i] = new CVulkanTexture();
 		bool bSuccess = pOutput->outputImages[i]->BInit(
 			uWidth, uHeight, 1u, pOutput->uOutputFormat,
-			outputImageflags, &dmabuf );
+			flags, &dmabuf );
 
 		if ( bSuccess && bHasOverlay )
 		{
@@ -3684,7 +4367,7 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 			pOutput->outputImagesPartialOverlay[i] = new CVulkanTexture();
 			bSuccess = pOutput->outputImagesPartialOverlay[i]->BInit(
 				uWidth, uHeight, 1u, pOutput->uOutputFormatOverlay,
-				outputImageflags, &overlayDmabuf );
+				flags, &overlayDmabuf );
 		}
 
 		wlr_dmabuf_attributes_finish( &dmabuf );
@@ -3697,9 +4380,12 @@ static bool vulkan_make_backend_output_images( VulkanOutput_t *pOutput,
 
 static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 {
+	pOutput->compositionScratch = nullptr;
 	CVulkanTexture::createFlags outputImageflags;
 	outputImageflags.bFlippable = true;
 	outputImageflags.bStorage = true;
+	outputImageflags.bColorAttachment = true;
+	outputImageflags.bTransferDst = true;
 	outputImageflags.bTransferSrc = true; // for screenshots
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
@@ -3724,16 +4410,19 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		l_nOutputHeight = g_nOutputWidth;
 	}
 
+
 	if ( GetBackend()->UsesBackendAllocatedScanout() )
 	{
 		if ( vulkan_make_backend_output_images( pOutput, outputImageflags, l_nOutputWidth, l_nOutputHeight ) )
 		{
+			if (!pOutput->outputImages[0]->storageImage())
+				vk_log.infof("GBM scanout supports raster composition; compute targets are allocated on demand");
 			// Oh no.
 			pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
 			return true;
 		}
 
-		vk_log.errorf( "Failed to create NVIDIA GBM scanout buffers; falling back to Vulkan scanout allocation." );
+		vk_log.errorf( "Failed to create backend GBM scanout buffers; falling back to Vulkan scanout allocation." );
 		for ( auto &pImage : pOutput->outputImages )
 			pImage = nullptr;
 		for ( auto &pImage : pOutput->outputImagesPartialOverlay )
@@ -4039,6 +4728,24 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 
 	CVulkanTexture::createFlags texCreateFlags;
 	texCreateFlags.bSampled = true;
+	if (pDMA->modifier != DRM_FORMAT_MOD_INVALID && pDMA->format != DRM_FORMAT_NV12 &&
+		dmabuf_supports_usage(pDMA->format, pDMA->modifier, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+		texCreateFlags.bTransferSrc = true;
+	if ( pDMA->modifier != DRM_FORMAT_MOD_INVALID && pDMA->format != DRM_FORMAT_NV12 &&
+		!dmabuf_supports_usage(pDMA->format, pDMA->modifier, VK_IMAGE_USAGE_SAMPLED_BIT) &&
+		dmabuf_supports_usage(pDMA->format, pDMA->modifier, VK_IMAGE_USAGE_TRANSFER_SRC_BIT) )
+	{
+		CVulkanTexture::createFlags sourceFlags;
+		sourceFlags.bTransferSrc = true;
+		gamescope::OwningRc<CVulkanTexture> source = new CVulkanTexture();
+		if ( !source->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, sourceFlags, pDMA ) )
+			return nullptr;
+		texCreateFlags.bTransferDst = true;
+		if ( !pTex->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, texCreateFlags ) )
+			return nullptr;
+		pTex->linearSource = std::move( source );
+		return pTex;
+	}
 
 	//fprintf(stderr, "pDMA->width: %d pDMA->height: %d pDMA->format: 0x%x pDMA->modifier: 0x%lx pDMA->n_planes: %d\n",
 	//	pDMA->width, pDMA->height, pDMA->format, pDMA->modifier, pDMA->n_planes);
@@ -4105,8 +4812,9 @@ static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_
 			textureFlags.bSampled = true; // required for RGB-to-NV12 shader to sample this texture
 			if ( !bDeviceLocal )
 			{
-				textureFlags.bMappable = true;
-				if (exportable || drmFormat == DRM_FORMAT_NV12) {
+				textureFlags.bReadback = g_device.isV3dv() && !exportable;
+				textureFlags.bMappable = !textureFlags.bReadback;
+				if (!textureFlags.bReadback && (exportable || drmFormat == DRM_FORMAT_NV12)) {
 					textureFlags.bExportable = true;
 					textureFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
 				}
@@ -4201,10 +4909,7 @@ struct BlitPushData_t
 			scale[i] = layer->scale;
 			offset[i] = layer->offsetPixelCenter();
 			opacity[i] = layer->opacity;
-            if (layer->isScreenSize() || (layer->filter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
-                u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
-            else
-                u_shaderFilter |= ((uint32_t)layer->filter) << (i * 4);
+			u_shaderFilter |= uint32_t( layer->shaderFilter() ) << (i * 4);
 
 			u_alphaMode |= ((uint32_t)layer->eAlphaBlendingMode) << ( i * 4 );
 
@@ -4396,7 +5101,7 @@ struct NisPushData_t
 };
 #pragma pack(pop)
 
-void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *frameInfo)
+void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *frameInfo, uint32_t encodedInputMask = 0)
 {
 	for ( int i = 0; i < frameInfo->layerCount; i++ )
 	{
@@ -4407,7 +5112,7 @@ void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *fram
                     || (layer->filter == GamescopeUpscaleFilter::LINEAR && !layer->viewConvertsToLinearAutomatically());
 
 		cmdBuffer->bindTexture(i, layer->tex);
-		cmdBuffer->setTextureSrgb(i, layer->colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR);
+		cmdBuffer->setTextureSrgb(i, (encodedInputMask & (1u << i)) || layer->colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR);
 		cmdBuffer->setSamplerNearest(i, nearest);
 		cmdBuffer->setSamplerUnnormalized(i, true);
 	}
@@ -4419,9 +5124,7 @@ void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *fram
 
 std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture )
 {
-	EOTF outputTF = frameInfo->outputEncodingEOTF;
-	if (!frameInfo->applyOutputColorMgmt)
-		outputTF = EOTF_Count; //Disable blending stuff.
+	EOTF outputTF = frameInfo->blendInDisplayEncoding ? EOTF_Count : frameInfo->outputEncodingEOTF;
 
 	auto cmdBuffer = g_device.commandBuffer();
 
@@ -4494,7 +5197,6 @@ bool vulkan_capture_prefers_readback( void )
 extern std::string g_reshade_effect;
 extern uint32_t g_reshade_technique_idx;
 
-ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
 static bool is_8bit_sdr_target( const CVulkanTexture *texture )
 {
@@ -4523,7 +5225,7 @@ static ShaderType blit_shader_for_target( const CVulkanTexture *texture )
 static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanTexture *output, EOTF outputTF )
 {
 	if ( frameInfo->layerCount != 1 ||
-	     !frameInfo->applyOutputColorMgmt ||
+	     frameInfo->blendInDisplayEncoding ||
 	     outputTF != EOTF_Gamma22 ||
 	     g_bHDRItmEnable ||
 	     g_uCompositeDebug != 0 ||
@@ -4546,20 +5248,18 @@ static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanText
 	     layer.colorspace != GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB )
 		return false;
 
-	for ( uint32_t i = 0; i < EOTF_Count; i++ )
-	{
-		if ( frameInfo->shaperLut[i] || frameInfo->lut3D[i] )
-			return false;
-	}
-
-	return true;
+	// RCAS writes encoded SDR into a bounded UNORM target. With one opaque
+	// layer, an identity SDR LUT adds no clamping or blending that changes it.
+	return (!frameInfo->shaperLut[EOTF_Gamma22] && !frameInfo->lut3D[EOTF_Gamma22]) ||
+		(frameInfo->shaperLut[EOTF_Gamma22] && frameInfo->lut3D[EOTF_Gamma22] &&
+		 frameInfo->shaperLut[EOTF_Gamma22]->identityLut && frameInfo->lut3D[EOTF_Gamma22]->identityLut);
 }
 
 static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTexture *output, EOTF outputTF )
 {
 	if ( cv_fsr_rcas_fp16 == 0 ||
 	     !g_device.supportsFp16() ||
-	     !frameInfo->applyOutputColorMgmt ||
+	     frameInfo->blendInDisplayEncoding ||
 	     outputTF != EOTF_Gamma22 ||
 	     g_bHDRItmEnable ||
 	     !is_8bit_sdr_target( output ) )
@@ -4584,9 +5284,90 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool applyRotation, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
-	EOTF outputTF = frameInfo->outputEncodingEOTF;
-	if (!frameInfo->applyOutputColorMgmt)
-		outputTF = EOTF_Count; //Disable blending stuff.
+	// Hardware sRGB views decode before filtering, exactly as the manual sRGB
+	// path requires. Keep PQ and formats without an sRGB view on software filtering.
+	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
+		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
+	FrameInfo_t sampledFrame = *frameInfo;
+	uint32_t predecodedLutMask = 0;
+	if (!frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 && !applyRotation && g_reshade_effect.empty())
+	{
+		if (g_uCompositeDebug == 0)
+		{
+			int retained = 0;
+			for (int i = 0; i < sampledFrame.layerCount; ++i)
+			{
+				auto &layer = sampledFrame.layers[i];
+				if (i > 0 && layer.opacity == 0.0f && layer.eAlphaBlendingMode != ALPHA_BLENDING_MODE_NONE)
+					continue;
+				const auto offset = layer.offsetPixelCenter();
+				const float x1 = offset.x * layer.scale.x, y1 = offset.y * layer.scale.y;
+				const float x2 = (currentOutputWidth - 1 + offset.x) * layer.scale.x;
+				const float y2 = (currentOutputHeight - 1 + offset.y) * layer.scale.y;
+				const bool coversOutput = layer.blackBorder ||
+					(std::min(x1, x2) >= 0 && std::min(y1, y2) >= 0 &&
+					 std::max(x1, x2) < layer.tex->width() && std::max(y1, y2) < layer.tex->height());
+				// NONE replaces every output pixel, including transparent borders.
+				if (i > 0 && (layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_NONE ||
+					(layer.opacity == 1.0f && !layer.hasAlpha() && coversOutput)))
+					retained = 0;
+				if (retained != i)
+					sampledFrame.layers[retained] = std::move(layer);
+				++retained;
+			}
+			sampledFrame.layerCount = retained;
+		}
+		for (int i = 0; i < sampledFrame.layerCount; ++i)
+		{
+			auto &layer = sampledFrame.layers[i];
+			if (layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB &&
+				!(layer.outputColorMgmtApplied && sampledFrame.outputEncodingEOTF == EOTF_Gamma22) &&
+				ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format())
+				layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
+		}
+		uint32_t usedEotfs = 0;
+		bool boundedSdr = true;
+		for (auto &layer : std::span(sampledFrame.layers, sampledFrame.layerCount))
+		{
+			if (layer.ctm && layer.ctm->View<glm::mat3x4>() == glm::mat3x4{
+				1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0})
+				layer.ctm = nullptr;
+			if (layer.outputColorMgmtApplied && sampledFrame.outputEncodingEOTF == EOTF_Gamma22 &&
+				layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB)
+				continue;
+			if (layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU)
+				continue;
+			const bool sdr = layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR ||
+				layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+			usedEotfs |= 1u << (g_bHDRItmEnable || !sdr ? EOTF_PQ : EOTF_Gamma22);
+			if (sdr)
+				boundedSdr &= !layer.ctm && ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format();
+		}
+		for (uint32_t i = 0; i < EOTF_Count; ++i)
+		{
+			// No dependency, descriptor reference, or shader work for unused tables.
+			const bool identity = sampledFrame.applyOutputColorMgmt && i == EOTF_Gamma22 && sampledFrame.outputEncodingEOTF == EOTF_Gamma22 &&
+				!g_bHDRItmEnable && boundedSdr && sampledFrame.shaperLut[i] && sampledFrame.lut3D[i] &&
+				sampledFrame.shaperLut[i]->identityLut && sampledFrame.lut3D[i]->identityLut;
+			if (!(usedEotfs & (1u << i)) || identity)
+			{
+				sampledFrame.shaperLut[i] = nullptr;
+				sampledFrame.lut3D[i] = nullptr;
+			}
+			else if (i == EOTF_Gamma22 && is_8bit_sdr_target(scanout.get()) && !sampledFrame.blendInDisplayEncoding &&
+				sampledFrame.outputEncodingEOTF == EOTF_Gamma22 && sampledFrame.shaperLut[i] &&
+				sampledFrame.shaperLut[i]->identityLut && sampledFrame.lut3D[i] && sampledFrame.lut3D[i]->predecodedLut)
+			{
+				sampledFrame.shaperLut[i] = sampledFrame.lut3D[i]->predecodedLut;
+				predecodedLutMask |= 1u << i;
+			}
+		}
+		frameInfo = &sampledFrame;
+	}
+
+	// Disabling gamut/tone mapping does not disable the output transfer function:
+	// ordinary SDR still needs linear-light blending followed by sRGB encoding.
+	EOTF outputTF = frameInfo->blendInDisplayEncoding ? EOTF_Count : frameInfo->outputEncodingEOTF;
 
 	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())
@@ -4618,18 +5399,48 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		g_reshadeManager.clear();
 	}
 
-	gamescope::Rc<CVulkanTexture> compositeImage;
-	if ( pOutputOverride )
-		compositeImage = pOutputOverride;
-	else
-		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
+	const auto &base = frameInfo->layers[0];
+	const auto *copySource = base.tex && base.tex->linearSource && base.tex->linearSourceDirty ? base.tex->linearSource.get() : base.tex.get();
+	const bool canCopyBase = frameInfo->layerCount > 0 && copySource && !partial && !pOutputOverride && !pPipewireTexture &&
+		!GetBackend()->UsesVulkanSwapchain() && !applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 &&
+		!frameInfo->blurLayer0 && !frameInfo->frameGenerationActive && !g_bHDRItmEnable && !g_pLastReshadeEffect && g_uCompositeDebug == 0 &&
+		outputTF == EOTF_Gamma22 && (base.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR || base.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB) &&
+		!base.ctm && !frameInfo->shaperLut[EOTF_Gamma22] && base.opacity == 1.0f &&
+		base.scale.x == 1.0f && base.scale.y == 1.0f && base.offset.x == 0.0f && base.offset.y == 0.0f &&
+		base.tex->width() == scanout->width() && base.tex->height() == scanout->height() &&
+		copySource->format() == scanout->format() && (copySource->usage() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+		(scanout->usage() & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+		(!DRMFormatHasAlpha(scanout->drmFormat()) || DRMFormatHasAlpha(copySource->drmFormat()));
+	const bool copyOnly = canCopyBase && frameInfo->layerCount == 1;
+	const bool raster = frameInfo->layerCount > 0 && scanout->colorAttachment() && g_device.queueFamily() == g_device.generalQueueFamily() &&
+		!applyRotation && !frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 &&
+		!pPipewireTexture && !g_bHDRItmEnable && g_uCompositeDebug == 0 &&
+		(outputTF == EOTF_Count || (outputTF == EOTF_Gamma22 && ToSrgbVulkanFormat(scanout->format()) != scanout->format())) &&
+		std::all_of(frameInfo->layers + 1, frameInfo->layers + frameInfo->layerCount,
+			[](const auto &layer) { return layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; });
+	if (!copyOnly && !raster && !pOutputOverride && !scanout->storageImage() && !g_output.compositionScratch)
+	{
+		CVulkanTexture::createFlags flags;
+		flags.bStorage = flags.bSampled = flags.bColorAttachment = flags.bTransferSrc = flags.bTransferDst = true;
+		g_output.compositionScratch = new CVulkanTexture();
+		if (!g_output.compositionScratch->BInit(scanout->width(), scanout->height(), 1, scanout->drmFormat(), flags))
+		{
+			g_output.compositionScratch = nullptr;
+			return std::nullopt;
+		}
+	}
+	gamescope::Rc<CVulkanTexture> compositeImage = copyOnly || raster || pOutputOverride || !g_output.compositionScratch
+		? scanout.get() : g_output.compositionScratch.get();
 
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 
-	for (uint32_t i = 0; i < EOTF_Count; i++)
-		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
+	if (!copyOnly)
+		for (uint32_t i = 0; i < EOTF_Count; i++)
+			cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
 
-	if ( frameInfo->useFSRLayer0 )
+	if (copyOnly)
+		cmdBuffer->copyImage(base.tex, scanout);
+	else if ( frameInfo->useFSRLayer0 )
 	{
 		uint32_t inputX = frameInfo->layers[0].tex->width();
 		uint32_t inputY = frameInfo->layers[0].tex->height();
@@ -4805,14 +5616,59 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 		} else {
-			cmdBuffer->bindPipeline( g_device.pipeline(blit_shader_for_target( compositeImage.get() ), frameInfo->layerCount, frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
-			bind_all_layers(cmdBuffer.get(), frameInfo);
+			CompositeShaderConfig_t compositeConfig = { 0, 0, 0 };
+			compositeConfig.opaqueOutput = !DRMFormatHasAlpha( compositeImage->drmFormat() );
+			for ( int i = 0; i < frameInfo->layerCount; i++ )
+			{
+				const auto &layer = frameInfo->layers[i];
+				compositeConfig.filterMask |= uint32_t( layer.shaderFilter() ) << (i * 4);
+				if ( layer.ctm )
+					compositeConfig.colorMgmtMask |= 1u << i;
+				const bool aligned = !layer.isYcbcr() && layer.scale.x == 1.0f && layer.scale.y == 1.0f &&
+					float_is_integer( layer.offset.x ) && float_is_integer( layer.offset.y );
+				if ( aligned )
+					compositeConfig.samplingMask |= 1u << (i + k_nMaxLayers);
+				// Aligned reads need no filtering: feed encoded texels directly to
+				// the SDR LUT instead of decoding and immediately encoding them again.
+				if (aligned && !layer.ctm && layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR &&
+					frameInfo->shaperLut[EOTF_Gamma22] && ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format())
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 3 * EOTF_Count + i);
+
+				if ( layer.blackBorder )
+					compositeConfig.samplingMask |= 1u << (i + 2 * k_nMaxLayers);
+				if ( aligned && layer.offset.x == 0.0f && layer.offset.y == 0.0f &&
+				     layer.tex->width() >= currentOutputWidth && layer.tex->height() >= currentOutputHeight )
+					compositeConfig.samplingMask |= 1u << i;
+			}
+			for ( uint32_t i = 0; i < EOTF_Count; i++ )
+			{
+				if (frameInfo->shaperLut[i])
+				{
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + i);
+					if (frameInfo->shaperLut[i]->identityLut || (predecodedLutMask & (1u << i)))
+						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + EOTF_Count + i);
+					if (predecodedLutMask & (1u << i))
+						compositeConfig.colorMgmtMask |= 1u << (2 * k_nMaxLayers + 3 * EOTF_Count + i);
+					if (frameInfo->shaperLut[i]->blackPreservingLut && frameInfo->lut3D[i] && frameInfo->lut3D[i]->blackPreservingLut)
+						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
+				}
+				else
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
+			}
+			const bool simpleBlend = frameInfo->layerCount > 0 && frameInfo->layers[0].opacity == 1.0f &&
+				std::all_of( frameInfo->layers + 1, frameInfo->layers + frameInfo->layerCount,
+					[]( const auto &layer ) { return layer.opacity == 1.0f && layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_PREMULTIPLIED; } );
+			bind_all_layers(cmdBuffer.get(), frameInfo, compositeConfig.colorMgmtMask >> (k_nMaxLayers + 3 * EOTF_Count));
 			cmdBuffer->bindTarget(compositeImage);
 			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
-
-			const int pixelsPerGroup = 8;
-
-			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
+			if (raster)
+				cmdBuffer->drawComposite(frameInfo, outputTF, compositeConfig, canCopyBase);
+			else
+			{
+				cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,
+					frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, simpleBlend, compositeConfig));
+				cmdBuffer->dispatch(div_roundup(currentOutputWidth, 8), div_roundup(currentOutputHeight, 8));
+			}
 		}
 	}
 
@@ -4896,7 +5752,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			cmdBuffer->copyImageToReadback(pPipewireTexture);
 	}
 
-	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
+	if ( !pOutputOverride && compositeImage != scanout )
+		cmdBuffer->copyImage( compositeImage, scanout );
+
+	uint64_t sequence = g_device.submit(std::move(cmdBuffer), !GetBackend()->UsesVulkanSwapchain() && !pOutputOverride);
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{
@@ -5801,7 +6660,7 @@ static const struct wlr_drm_format_set *renderer_get_texture_formats( struct wlr
 {
 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF)
 	{
-		if ( !g_device.supportsClientDmabufs() )
+		if ( !g_device.supportsClientDmabufs() || sampledDRMFormats.len == 0 )
 			return nullptr;
 
 		return &sampledDRMFormats;
