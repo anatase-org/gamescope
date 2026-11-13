@@ -4712,6 +4712,14 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	{
 
 
+		for (int i = 0; i < sampledFrame.layerCount; ++i)
+		{
+			auto &layer = sampledFrame.layers[i];
+			if (layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB &&
+				!(layer.outputColorMgmtApplied && sampledFrame.outputEncodingEOTF == EOTF_Gamma22) &&
+				ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format())
+				layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
+		}
 		uint32_t usedEotfs = 0;
 		bool boundedSdr = true;
 		for (auto &layer : std::span(sampledFrame.layers, sampledFrame.layerCount))
