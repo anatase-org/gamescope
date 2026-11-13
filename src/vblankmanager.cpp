@@ -86,8 +86,13 @@ namespace gamescope
 		const uint64_t ulNow = get_time_in_nanos();
 
 		uint64_t ulTargetPoint = GetLastVBlank() + ulIntervalNSecs - ulOffset;
-
-		while ( ulTargetPoint < ulNow )
+		const uint64_t ulProcessed = m_ulLastProcessedVBlank;
+		const uint64_t ulLateMargin = m_bCurrentlyCompositing ? m_ulVBlankDrawBufferRedZone : 0;
+		// Page-flip feedback can arrive after the timer was rearmed. Do not issue
+		// another wakeup for an already processed refresh, even if its predicted
+		// timestamp moved slightly. A late, unprocessed refresh can use the margin.
+		while (ulTargetPoint + ulOffset <= ulProcessed + ulIntervalNSecs / 2 ||
+			(ulTargetPoint < ulNow && ulNow - ulTargetPoint > ulLateMargin))
 			ulTargetPoint += ulIntervalNSecs;
 
 		return ulTargetPoint;
@@ -260,6 +265,7 @@ namespace gamescope
 				return;
 
 
+			m_ulLastProcessedVBlank = m_TimerFDSchedule.ulTargetVBlank;
 			m_PendingVBlank = VBlankTime
 			{
 				.schedule = m_TimerFDSchedule,
@@ -314,6 +320,7 @@ namespace gamescope
 			}
 
 			gpuvis_trace_printf( "got vblank" );
+			m_ulLastProcessedVBlank = time.schedule.ulTargetVBlank;
 			m_PendingVBlank = time;
 		}
 	}
