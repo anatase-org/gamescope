@@ -383,3 +383,6 @@ executable('gamescopectl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamesc
 executable('gamescope-type', ['Apps/gamescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
 
 executable('gamescope_hotkey_example', ['Apps/gamescope_hotkey_example.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, xkbcommon, cap_dep], install: false )
+
+executable('gamescope-damage', 'Apps/gamescope_damage.cpp',
+  dependencies: [dep_x11, thread_dep], cpp_args: ['-fexceptions', '-fno-fast-math'])
