@@ -3493,7 +3493,7 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 	if (changed3d)
 		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
 	g_device.submit(std::move(cmdBuffer));
-	g_device.waitIdle(); // TODO: Sync this better
+	// Queue barriers make uploads visible; the upload arena waits before reuse.
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_get_hacky_blank_texture()
