@@ -468,102 +468,30 @@ vec3 perform_3dlut_native(vec3 color, sampler3D lut3D) {
 // https://github.com/AcademySoftwareFoundation/OpenColorIO/ops/lut3d/Lut3DOpGPU.cpp
 // License available in their repo and in our LICENSE file.
 vec3 perform_3dlut_tetrahedral(vec3 color, sampler3D lut3D) {
-    ivec3 size_i = textureSize(lut3D, 0);
-    // We only support uniform lut sizes so take .x's dim
-    float size = float(size_i.x);
-    float incr = 1.0f / size;
+    vec3 size = vec3(textureSize(lut3D, 0));
+    vec3 coords = color * (size - 1.0);
+    vec3 origin = floor(coords);
+    vec3 fraction = coords - origin;
 
-    vec3 outColor = color.bgr;
+    // Select the tetrahedron's two inner vertices before issuing texture reads.
+    // Divergent color-dependent branches otherwise execute several fetch paths
+    // per subgroup, although each pixel only needs four vertices.
+    bool firstR = fraction.r >= fraction.g && fraction.r >= fraction.b;
+    bool firstG = fraction.r < fraction.g && fraction.g > fraction.b;
+    vec3 first = vec3(firstR, firstG, !firstR && !firstG);
+    bool lastR = fraction.r < fraction.g && fraction.r < fraction.b;
+    bool lastG = fraction.r >= fraction.g && fraction.g < fraction.b;
+    vec3 last = vec3(lastR, lastG, !lastR && !lastG);
+    float largest = max(fraction.r, max(fraction.g, fraction.b));
+    float smallest = min(fraction.r, min(fraction.g, fraction.b));
+    float middle = max(min(fraction.r, fraction.g), min(max(fraction.r, fraction.g), fraction.b));
 
-    vec3 coords = outColor.rgb * (vec3(size - 1.0f));
-    vec3 baseInd = floor(coords);
-    vec3 frac = coords - baseInd;
-    vec3 f1, f4;
-    baseInd = (baseInd.zyx + vec3(0.5)) / vec3(size);
-    vec3 v1 = textureLod(lut3D, baseInd, 0).rgb;
-    vec3 nextInd = baseInd + vec3(incr);
-    vec3 v4 = textureLod(lut3D, nextInd, 0).rgb;
-    if (frac.r >= frac.g)
-    {
-        if (frac.g >= frac.b)
-        {
-            nextInd = baseInd + vec3(0, 0, incr);
-            vec3 v2 = textureLod(lut3D, nextInd, 0).rgb;
-            nextInd = baseInd + vec3(0, incr, incr);
-            vec3 v3 = textureLod(lut3D, nextInd, 0).rgb;
-            f1 = vec3(1.0f - frac.r);
-            f4 = vec3(frac.b);
-            vec3 f2 = vec3(frac.r - frac.g);
-            vec3 f3 = vec3(frac.g - frac.b);
-            outColor.rgb = (f2 * v2) + (f3 * v3);
-        }
-        else if (frac.r >= frac.b)
-        {
-            nextInd = baseInd + vec3(0, 0, incr);
-            vec3 v2 = textureLod(lut3D, nextInd, 0).rgb;
-            nextInd = baseInd + vec3(incr, 0, incr);
-            vec3 v3 = textureLod(lut3D, nextInd, 0).rgb;
-            f1 = vec3(1.0f - frac.r);
-            f4 = vec3(frac.g);
-            vec3 f2 = vec3(frac.r - frac.b);
-            vec3 f3 = vec3(frac.b - frac.g);
-            outColor.rgb = (f2 * v2) + (f3 * v3);
-        }
-        else
-        {
-            nextInd = baseInd + vec3(incr, 0, 0);
-            vec3 v2 = textureLod(lut3D, nextInd, 0).rgb;
-            nextInd = baseInd + vec3(incr, 0, incr);
-            vec3 v3 = textureLod(lut3D, nextInd, 0).rgb;
-            f1 = vec3(1.0f - frac.b);
-            f4 = vec3(frac.g);
-            vec3 f2 = vec3(frac.b - frac.r);
-            vec3 f3 = vec3(frac.r - frac.g);
-            outColor.rgb = (f2 * v2) + (f3 * v3);
-        }
-    }
-    else
-    {
-        if (frac.g <= frac.b)
-        {
-            nextInd = baseInd + vec3(incr, 0, 0);
-            vec3 v2 = textureLod(lut3D, nextInd, 0).rgb;
-            nextInd = baseInd + vec3(incr, incr, 0);
-            vec3 v3 = textureLod(lut3D, nextInd, 0).rgb;
-            f1 = vec3(1.0f - frac.b);
-            f4 = vec3(frac.r);
-            vec3 f2 = vec3(frac.b - frac.g);
-            vec3 f3 = vec3(frac.g - frac.r);
-            outColor.rgb = (f2 * v2) + (f3 * v3);
-        }
-        else if (frac.r >= frac.b)
-        {
-            nextInd = baseInd + vec3(0, incr, 0);
-            vec3 v2 = textureLod(lut3D, nextInd, 0).rgb;
-            nextInd = baseInd + vec3(0, incr, incr);
-            vec3 v3 = textureLod(lut3D, nextInd, 0).rgb;
-            f1 = vec3(1.0f - frac.g);
-            f4 = vec3(frac.b);
-            vec3 f2 = vec3(frac.g - frac.r);
-            vec3 f3 = vec3(frac.r - frac.b);
-            outColor.rgb = (f2 * v2) + (f3 * v3);
-        }
-        else
-        {
-            nextInd = baseInd + vec3(0, incr, 0);
-            vec3 v2 = textureLod(lut3D, nextInd, 0).rgb;
-            nextInd = baseInd + vec3(incr, incr, 0);
-            vec3 v3 = textureLod(lut3D, nextInd, 0).rgb;
-            f1 = vec3(1.0f - frac.g);
-            f4 = vec3(frac.r);
-            vec3 f2 = vec3(frac.g - frac.b);
-            vec3 f3 = vec3(frac.b - frac.r);
-            outColor.rgb = (f2 * v2) + (f3 * v3);
-        }
-    }
-    outColor.rgb = outColor.rgb + (f1 * v1) + (f4 * v4);
-
-    return outColor.rgb;
+    vec3 base = (origin + 0.5) / size;
+    vec3 v1 = textureLod(lut3D, base, 0).rgb;
+    vec3 v2 = textureLod(lut3D, base + first / size, 0).rgb;
+    vec3 v3 = textureLod(lut3D, base + (1.0 - last) / size, 0).rgb;
+    vec3 v4 = textureLod(lut3D, base + 1.0 / size, 0).rgb;
+    return ((largest - middle) * v2 + (middle - smallest) * v3) + (1.0 - largest) * v1 + smallest * v4;
 }
 
 vec3 perform_3dlut(vec3 color, sampler3D lut3D)
