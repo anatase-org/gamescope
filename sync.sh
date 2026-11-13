@@ -164,7 +164,10 @@ if [ "$REMOTE_ARCH" != "$TARGET_ARCH" ]; then
     exit 1
 fi
 
-meson setup "$BUILD_DIR" "$@" --prefix=/usr --libdir=lib64 -Dforce_fallback_for=stb,libdisplay-info,libliftoff,wlroots,vkroots -Denable_openvr_support=false
+if [ -f "$BUILD_DIR/build.ninja" ]; then
+    set -- "$@" --reconfigure
+fi
+meson setup "$BUILD_DIR" "$@" --buildtype=debugoptimized --prefix=/usr --libdir=lib64 -Dforce_fallback_for=stb,libdisplay-info,libliftoff,wlroots,vkroots -Denable_openvr_support=false
 ninja -C "$BUILD_DIR"
 scp "$BUILD_DIR/src/gamescope" "${HOST}:gamescope"
 scp "$BUILD_DIR/layer/libVkLayer_FROG_gamescope_wsi_${TARGET_ARCH}.so" "${HOST}:gamescope-wsi.so"
