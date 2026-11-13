@@ -221,6 +221,8 @@ public:
 	gamescope::OwningRc<CVulkanTexture> linearSource;
 	bool linearSourceDirty = true;
 	std::vector<uint16_t> uploadedLut;
+	bool identityLut = false;
+	bool blackPreservingLut = false;
 
 private:
 	bool m_bInitialized = false;

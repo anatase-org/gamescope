@@ -3480,6 +3480,29 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 	lut1d->uploadedLut.assign(static_cast<uint16_t *>(lut1d_data), static_cast<uint16_t *>(lut1d_data) + lut1d_size / sizeof(uint16_t));
 	lut3d->uploadedLut.assign(static_cast<uint16_t *>(lut3d_data), static_cast<uint16_t *>(lut3d_data) + lut3d_size / sizeof(uint16_t));
 
+	// Recognize identity tables once, at upload, including explicitly supplied LUTs.
+	// One 16-bit quantization step accounts for roundoff in generated matrices.
+	const auto identityValue = [](uint16_t value, uint32_t coordinate, uint32_t size) {
+		return size > 1 && std::abs(int(value) - int(std::lround(65535.0 * coordinate / (size - 1)))) <= 1;
+	};
+	const auto *one = static_cast<const uint16_t *>(lut1d_data);
+	lut1d->identityLut = lut1d->width() > 1;
+	for (uint32_t x = 0; x < lut1d->width() && lut1d->identityLut; ++x)
+		for (uint32_t c = 0; c < 3; ++c)
+			lut1d->identityLut &= identityValue(one[4 * x + c], x, lut1d->width());
+	const auto *three = static_cast<const uint16_t *>(lut3d_data);
+	lut1d->blackPreservingLut = one[0] == 0 && one[1] == 0 && one[2] == 0;
+	lut3d->blackPreservingLut = three[0] == 0 && three[1] == 0 && three[2] == 0;
+	lut3d->identityLut = lut3d->width() > 1 && lut3d->height() > 1 && lut3d->depth() > 1;
+	for (uint32_t z = 0; z < lut3d->depth() && lut3d->identityLut; ++z)
+		for (uint32_t y = 0; y < lut3d->height() && lut3d->identityLut; ++y)
+			for (uint32_t x = 0; x < lut3d->width() && lut3d->identityLut; ++x)
+			{
+				const size_t p = 4 * (x + lut3d->width() * (y + lut3d->height() * z));
+				lut3d->identityLut &= identityValue(three[p], x, lut3d->width()) &&
+					identityValue(three[p + 1], y, lut3d->height()) && identityValue(three[p + 2], z, lut3d->depth());
+			}
+
 	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size);
 
 	void* lut1d_dst = base_dst;
@@ -4684,6 +4707,46 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool applyRotation, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
+	FrameInfo_t sampledFrame = *frameInfo;
+	if (!frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 && !applyRotation && g_reshade_effect.empty())
+	{
+
+
+		uint32_t usedEotfs = 0;
+		bool boundedSdr = true;
+		for (auto &layer : std::span(sampledFrame.layers, sampledFrame.layerCount))
+		{
+			if (layer.ctm && layer.ctm->View<glm::mat3x4>() == glm::mat3x4{
+				1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0})
+				layer.ctm = nullptr;
+			if (layer.outputColorMgmtApplied && sampledFrame.outputEncodingEOTF == EOTF_Gamma22 &&
+				layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB)
+				continue;
+			if (layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU)
+				continue;
+			const bool sdr = layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR ||
+				layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+			usedEotfs |= 1u << (g_bHDRItmEnable || !sdr ? EOTF_PQ : EOTF_Gamma22);
+			if (sdr)
+				boundedSdr &= !layer.ctm && ToSrgbVulkanFormat(layer.tex->format()) != layer.tex->format();
+		}
+		for (uint32_t i = 0; i < EOTF_Count; ++i)
+		{
+			// No dependency, descriptor reference, or shader work for unused tables.
+			const bool identity = sampledFrame.applyOutputColorMgmt && i == EOTF_Gamma22 && sampledFrame.outputEncodingEOTF == EOTF_Gamma22 &&
+				!g_bHDRItmEnable && boundedSdr && sampledFrame.shaperLut[i] && sampledFrame.lut3D[i] &&
+				sampledFrame.shaperLut[i]->identityLut && sampledFrame.lut3D[i]->identityLut;
+			if (!(usedEotfs & (1u << i)) || identity)
+			{
+				sampledFrame.shaperLut[i] = nullptr;
+				sampledFrame.lut3D[i] = nullptr;
+			}
+
+		}
+		frameInfo = &sampledFrame;
+	}
+
+
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
 	if (frameInfo->blendInDisplayEncoding)
 		outputTF = EOTF_Count; // Mura correction blends encoded values.
