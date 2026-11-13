@@ -1889,7 +1889,9 @@ bool MouseCursor::getTexture()
 
 	if (image->width && image->height)
 	{
-		if ( nDesiredWidth < image->width || nDesiredHeight < image->height )
+		// Resize square cursors once here instead of upscaling them every frame.
+		bool upscale = image->width == image->height && nDesiredWidth > image->width;
+		if ( upscale || nDesiredWidth < image->width || nDesiredHeight < image->height )
 		{
 			std::vector<uint32_t> pixels(image->width * image->height);
 			for (int i = 0; i < image->height; i++)
