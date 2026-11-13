@@ -230,6 +230,7 @@ public:
 	std::unique_ptr<CompositeState_t> compositeState;
 	std::vector<uint16_t> uploadedLut;
 	bool identityLut = false;
+	gamescope::Rc<CVulkanTexture> predecodedLut;
 	bool blackPreservingLut = false;
 
 private:
@@ -547,7 +548,7 @@ bool acquire_next_image( void );
 bool vulkan_primary_dev_id(dev_t *id);
 bool vulkan_supports_modifiers(void);
 
-gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size);
+gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size, VkFormat format = VK_FORMAT_R16G16B16A16_UNORM);
 gamescope::Rc<CVulkanTexture> vulkan_create_3d_lut(uint32_t width, uint32_t height, uint32_t depth);
 void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamescope::Rc<CVulkanTexture>& lut3d, void* lut1d_data, void* lut3d_data);
 

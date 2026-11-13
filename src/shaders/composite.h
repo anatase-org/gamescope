@@ -127,6 +127,15 @@ vec3 apply_layer_color_mgmt(vec3 color, uint layer, uint colorspace, bool encode
         : (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + plane_eotf))) != 0;
     if (lut3d_enabled)
     {
+        // Compact curves already contain the original LUT and its blend TF at
+        // every 8-bit code. Other sampling geometries keep the original 3D LUT.
+        if (encodedInput && (c_colorMgmtMask & (1u << (2 * VKR_MAX_LAYERS + 3 * EOTF_Count + plane_eotf))) != 0) {
+            // The nearest, unnormalized sampler selects exact 8-bit entries.
+            vec3 coord = color * 255.0 + vec3(0.5, 256.5, 512.5);
+            return vec3(textureLod(s_shaperLut[plane_eotf], coord.r, 0.0).r,
+                        textureLod(s_shaperLut[plane_eotf], coord.g, 0.0).r,
+                        textureLod(s_shaperLut[plane_eotf], coord.b, 0.0).r);
+        }
         if (!encodedInput)
             color = colorspace_plane_shaper_tf(color, colorspace);
         if (c_colorMgmtMask == 0xffffffffu || (c_colorMgmtMask & (1u << (VKR_MAX_LAYERS + EOTF_Count + plane_eotf))) == 0)

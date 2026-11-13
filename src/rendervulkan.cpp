@@ -34,6 +34,7 @@
 #include "wlr_end.hpp"
 
 #include "rendervulkan.hpp"
+#include <glm/gtc/packing.hpp>
 #include "main.hpp"
 #include "steamcompmgr.hpp"
 #include "frame_generation_config.hpp"
@@ -2103,7 +2104,13 @@ void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTex
 		nearestState.bNearest = true;
 		nearestState.bUnnormalized = false;
 
-		shaperLutDescriptor[i].sampler = m_device->sampler(linearState);
+		SamplerState shaperState = linearState;
+		if (m_shaperLut[i] && m_shaperLut[i]->format() == VK_FORMAT_R16_SFLOAT)
+		{
+			shaperState.bNearest = true;
+			shaperState.bUnnormalized = true;
+		}
+		shaperLutDescriptor[i].sampler = m_device->sampler(shaperState);
 		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
 		// I need to change this, it's so utterly stupid and confusing.
@@ -3927,7 +3934,7 @@ void vulkan_present_to_window( uint64_t frameGenerationOutputId )
 		vulkan_remake_swapchain();
 }
 
-gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size)
+gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size, VkFormat format)
 {
 	CVulkanTexture::createFlags flags;
 	flags.bSampled = true;
@@ -3935,7 +3942,7 @@ gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size)
 	flags.imageType = VK_IMAGE_TYPE_1D;
 
 	auto texture = new CVulkanTexture();
-	auto drmFormat = VulkanFormatToDRM( VK_FORMAT_R16G16B16A16_UNORM );
+	auto drmFormat = VulkanFormatToDRM( format );
 	bool bRes = texture->BInit( size, 1u, 1u, drmFormat, flags );
 	assert( bRes );
 
@@ -3959,9 +3966,8 @@ gamescope::Rc<CVulkanTexture> vulkan_create_3d_lut(uint32_t width, uint32_t heig
 
 void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamescope::Rc<CVulkanTexture>& lut3d, void* lut1d_data, void* lut3d_data)
 {
-	size_t lut1d_size = lut1d->width() * sizeof(uint16_t) * 4;
-	size_t lut3d_size = lut3d->width() * lut3d->height() * lut3d->depth() * sizeof(uint16_t) * 4;
-
+	const size_t lut1d_size = lut1d->width() * sizeof(uint16_t) * 4;
+	const size_t lut3d_size = size_t(lut3d->width()) * lut3d->height() * lut3d->depth() * sizeof(uint16_t) * 4;
 	const auto unchanged = [](const auto &texture, const void *data, size_t size) {
 		return texture->uploadedLut.size() * sizeof(uint16_t) == size && !memcmp(texture->uploadedLut.data(), data, size);
 	};
@@ -3995,20 +4001,63 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 					identityValue(three[p + 1], y, lut3d->height()) && identityValue(three[p + 2], z, lut3d->depth());
 			}
 
-	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size);
+	// A separable 3D LUT is three independent curves. For aligned 8-bit SDR
+	// samples, tabulate every possible input value, including blend linearization.
+	// This preserves the LUT instead of dropping night mode or changing filtering.
+	std::optional<std::array<uint16_t, 256 * 3>> predecoded;
+	const std::array<uint32_t, 3> sizes{lut3d->width(), lut3d->height(), lut3d->depth()};
+	const std::array<size_t, 3> strides{1, sizes[0], size_t(sizes[0]) * sizes[1]};
+	bool separable = lut1d->identityLut && !lut3d->identityLut &&
+		std::all_of(sizes.begin(), sizes.end(), [](auto size) { return size > 1; });
+	for (uint32_t z = 0; z < sizes[2] && separable; ++z)
+		for (uint32_t y = 0; y < sizes[1] && separable; ++y)
+			for (uint32_t x = 0; x < sizes[0] && separable; ++x)
+			{
+				const size_t p = 4 * (x + sizes[0] * (y + sizes[1] * z));
+				const std::array<uint32_t, 3> coordinates{x, y, z};
+				for (uint32_t c = 0; c < 3; ++c)
+					separable &= std::abs(int(three[p + c]) - int(three[4 * strides[c] * coordinates[c] + c])) <= 1;
+			}
+	if (separable)
+	{
+		predecoded.emplace();
+		for (uint32_t x = 0; x < 256; ++x)
+			for (uint32_t c = 0; c < 3; ++c)
+			{
+				const double p = double(x) * (sizes[c] - 1) / 255.0;
+				const uint32_t lo = uint32_t(p), hi = std::min(lo + 1, sizes[c] - 1);
+				const double a = three[4 * strides[c] * lo + c] / 65535.0;
+				const double b = three[4 * strides[c] * hi + c] / 65535.0;
+				const double encoded = a + (b - a) * (p - lo);
+				const double linear = encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4);
+				(*predecoded)[256 * c + x] = glm::packHalf1x16(float(linear));
+			}
+		if (!lut3d->predecodedLut)
+			lut3d->predecodedLut = vulkan_create_1d_lut(256 * 3, VK_FORMAT_R16_SFLOAT);
+		lut3d->predecodedLut->blackPreservingLut = lut3d->blackPreservingLut;
+	}
+	else
+		lut3d->predecodedLut = nullptr;
+	const size_t predecodedSize = predecoded ? sizeof(*predecoded) : 0;
+	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size + predecodedSize);
 
 	void* lut1d_dst = base_dst;
 	void *lut3d_dst = ((uint8_t*)base_dst) + lut1d_size;
 	memcpy(lut1d_dst, lut1d_data, lut1d_size);
 	memcpy(lut3d_dst, lut3d_data, lut3d_size);
+	if (predecoded)
+		memcpy(static_cast<uint8_t *>(base_dst) + lut1d_size + lut3d_size, predecoded->data(), predecodedSize);
 
 	auto cmdBuffer = g_device.commandBuffer();
 	if (changed1d)
 		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
 	if (changed3d)
 		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
+	if (predecoded)
+		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size + lut3d_size, 0, lut3d->predecodedLut);
+	// Subsequent draws use the same queue and the command-buffer barriers make
+	// these writes visible. The upload arena waits before reusing its storage.
 	g_device.submit(std::move(cmdBuffer));
-	// Queue barriers make uploads visible; the upload arena waits before reuse.
 }
 
 gamescope::Rc<CVulkanTexture> vulkan_get_hacky_blank_texture()
@@ -5195,6 +5244,9 @@ static bool can_use_fp16_fsr_rcas( const FrameInfo_t *frameInfo, const CVulkanTe
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer, bool applyRotation, gamescope::Rc<CVulkanTexture> pFsrIntermediateOverride )
 {
 	FrameInfo_t sampledFrame = *frameInfo;
+	uint32_t predecodedLutMask = 0;
+	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
+		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
 	if (!frameInfo->useFSRLayer0 && !frameInfo->useNISLayer0 && !frameInfo->blurLayer0 && !applyRotation && g_reshade_effect.empty())
 	{
 
@@ -5261,6 +5313,13 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				sampledFrame.shaperLut[i] = nullptr;
 				sampledFrame.lut3D[i] = nullptr;
 			}
+			else if (i == EOTF_Gamma22 && is_8bit_sdr_target(scanout.get()) && !sampledFrame.blendInDisplayEncoding &&
+				sampledFrame.outputEncodingEOTF == EOTF_Gamma22 && sampledFrame.shaperLut[i] &&
+				sampledFrame.shaperLut[i]->identityLut && sampledFrame.lut3D[i] && sampledFrame.lut3D[i]->predecodedLut)
+			{
+				sampledFrame.shaperLut[i] = sampledFrame.lut3D[i]->predecodedLut;
+				predecodedLutMask |= 1u << i;
+			}
 
 		}
 		frameInfo = &sampledFrame;
@@ -5301,8 +5360,6 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		g_reshadeManager.clear();
 	}
 
-	gamescope::Rc<CVulkanTexture> scanout = pOutputOverride ? pOutputOverride.get()
-		: partial ? g_output.outputImagesPartialOverlay[g_output.nOutImage].get() : g_output.outputImages[g_output.nOutImage].get();
 	const auto &base = frameInfo->layers[0];
 	const auto *copySource = base.tex && base.tex->linearSource && base.tex->linearSourceDirty ? base.tex->linearSource.get() : base.tex.get();
 	const bool canCopyBase = frameInfo->layerCount > 0 && copySource && !partial && !pOutputOverride && !pPipewireTexture &&
@@ -5547,8 +5604,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 				if (frameInfo->shaperLut[i])
 				{
 					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + i);
-					if (frameInfo->shaperLut[i]->identityLut)
+					if (frameInfo->shaperLut[i]->identityLut || (predecodedLutMask & (1u << i)))
 						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + EOTF_Count + i);
+					if (predecodedLutMask & (1u << i))
+						compositeConfig.colorMgmtMask |= 1u << (2 * k_nMaxLayers + 3 * EOTF_Count + i);
 					if (frameInfo->shaperLut[i]->blackPreservingLut && frameInfo->lut3D[i] && frameInfo->lut3D[i]->blackPreservingLut)
 						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
 				}
