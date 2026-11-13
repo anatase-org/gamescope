@@ -218,6 +218,8 @@ public:
 	~CVulkanTexture( void );
 
 	uint32_t queueFamily = VK_QUEUE_FAMILY_IGNORED;
+	gamescope::OwningRc<CVulkanTexture> linearSource;
+	bool linearSourceDirty = true;
 
 private:
 	bool m_bInitialized = false;

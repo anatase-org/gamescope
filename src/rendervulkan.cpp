@@ -1392,7 +1392,8 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pWaitSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
 		ulWaitPoints.push_back( dep.ulPoint );
-		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT );
+		// Client buffers can first be read by a transfer into a sampled shadow.
+		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_ALL_COMMANDS_BIT );
 	}
 
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
@@ -2036,6 +2037,11 @@ static uint32_t external_queue_family( CVulkanDevice *device )
 
 void CVulkanCmdBuffer::prepareSrcImage(CVulkanTexture *image)
 {
+	if ( image->linearSource && image->linearSourceDirty && !m_textureState.contains(image) )
+	{
+		copyImage(image->linearSource, image);
+		image->linearSourceDirty = false;
+	}
 	auto result = m_textureState.emplace(image, TextureState());
 	// no need to reimport if the image didn't change
 	if (!result.second)
@@ -2720,7 +2726,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 		m_dmabuf = dmabuf;
 	}
-	else if ( pDMA != nullptr && flags.bFlippable == true )
+	else if ( pDMA != nullptr && (flags.bFlippable || (flags.bTransferSrc && !flags.bSampled)) )
 	{
 		m_dmabuf = *pDMA;
 		m_dmabuf.n_planes = 0;
@@ -3148,6 +3154,12 @@ static bool is_image_format_modifier_supported(VkFormat format, uint32_t drmForm
   };
 
   VkResult res = g_device.vk.GetPhysicalDeviceImageFormatProperties2( g_device.physDev(), &imageFormatInfo, &imageFormatProps );
+  if (res == VK_ERROR_FORMAT_NOT_SUPPORTED && drmFormat != DRM_FORMAT_NV12)
+  {
+    // Import transfer-only RGB modifiers through the sampled shadow on any GPU.
+    imageFormatInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    res = g_device.vk.GetPhysicalDeviceImageFormatProperties2( g_device.physDev(), &imageFormatInfo, &imageFormatProps );
+  }
   return res == VK_SUCCESS;
 }
 
@@ -3232,13 +3244,17 @@ bool vulkan_init_format(VkFormat format, uint32_t drmFormat)
 			if ( !is_image_format_modifier_supported( format, drmFormat, modifier ) )
 				continue;
 
-			if ( ( modifierProps[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ) == 0 )
+			const VkFormatFeatureFlags requiredFeature = drmFormat != DRM_FORMAT_NV12 &&
+				!(modifierProps[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+				? VK_FORMAT_FEATURE_TRANSFER_SRC_BIT : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+			if ( ( modifierProps[j].drmFormatModifierTilingFeatures & requiredFeature ) == 0 )
 			{
 				continue;
 			}
 
-			// The deferred backend exposes all sample-able formats as supported modifiers.
-			if ( !g_bAllowDeferredBackend )
+			// Composed clients need sampler-compatible modifiers, not KMS-compatible
+			// ones. Backend-allocated scanout already forces their composition.
+			if ( !g_bAllowDeferredBackend && !GetBackend()->UsesBackendAllocatedScanout() )
 			{
 				if ( GetBackend()->UsesModifiers() && !gamescope::Algorithm::Contains( GetBackend()->GetSupportedModifiers( drmFormat ), modifier ) )
 					continue;
@@ -4089,6 +4105,24 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 
 	CVulkanTexture::createFlags texCreateFlags;
 	texCreateFlags.bSampled = true;
+	if (pDMA->modifier != DRM_FORMAT_MOD_INVALID && pDMA->format != DRM_FORMAT_NV12 &&
+		dmabuf_supports_usage(pDMA->format, pDMA->modifier, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+		texCreateFlags.bTransferSrc = true;
+	if ( pDMA->modifier != DRM_FORMAT_MOD_INVALID && pDMA->format != DRM_FORMAT_NV12 &&
+		!dmabuf_supports_usage(pDMA->format, pDMA->modifier, VK_IMAGE_USAGE_SAMPLED_BIT) &&
+		dmabuf_supports_usage(pDMA->format, pDMA->modifier, VK_IMAGE_USAGE_TRANSFER_SRC_BIT) )
+	{
+		CVulkanTexture::createFlags sourceFlags;
+		sourceFlags.bTransferSrc = true;
+		gamescope::OwningRc<CVulkanTexture> source = new CVulkanTexture();
+		if ( !source->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, sourceFlags, pDMA ) )
+			return nullptr;
+		texCreateFlags.bTransferDst = true;
+		if ( !pTex->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, texCreateFlags ) )
+			return nullptr;
+		pTex->linearSource = std::move( source );
+		return pTex;
+	}
 
 	//fprintf(stderr, "pDMA->width: %d pDMA->height: %d pDMA->format: 0x%x pDMA->modifier: 0x%lx pDMA->n_planes: %d\n",
 	//	pDMA->width, pDMA->height, pDMA->format, pDMA->modifier, pDMA->n_planes);
@@ -5864,7 +5898,7 @@ static const struct wlr_drm_format_set *renderer_get_texture_formats( struct wlr
 {
 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF)
 	{
-		if ( !g_device.supportsClientDmabufs() )
+		if ( !g_device.supportsClientDmabufs() || sampledDRMFormats.len == 0 )
 			return nullptr;
 
 		return &sampledDRMFormats;

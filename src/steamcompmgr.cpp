@@ -1494,6 +1494,8 @@ import_commit (
 	{
 		if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
 		{
+			// Refresh the sampled shadow whenever this producer buffer is reused.
+			pTexture->linearSourceDirty = true;
 			// Going from OwningRc -> Rc now.
 			commit->vulkanTex = pTexture;
 			return commit;
