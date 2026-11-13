@@ -329,8 +329,11 @@ bool CVulkanDevice::BInit(VkInstance instance, VkSurfaceKHR surface)
 
 	m_bInitialized = true;
 
-	std::thread piplelineThread([this](){compileAllPipelines();});
-	piplelineThread.detach();
+	if ( !isV3dv() )
+	{
+		std::thread piplelineThread([this](){compileAllPipelines();});
+		piplelineThread.detach();
+	}
 
 	g_reshadeManager.init(this);
 
