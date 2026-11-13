@@ -1512,8 +1512,9 @@ import_commit (
 	{
 		if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
 		{
-			// Refresh the sampled shadow whenever this producer buffer is reused.
+			// Refresh a linear-buffer snapshot when its producer commits new contents.
 			pTexture->linearSourceDirty = true;
+			++pTexture->contentVersion;
 			// Going from OwningRc -> Rc now.
 			commit->vulkanTex = pTexture;
 			return commit;
@@ -2141,6 +2142,7 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	if (layer->colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB)
 		layer->ctm = s_scRGB709To2020Matrix;
 	layer->tex = commit->vulkanTex;
+	layer->damage = commit->damage;
 
 	layer->filter = base.filter;
 	layer->eAlphaBlendingMode = base.eAlphaBlendingMode;
@@ -2210,6 +2212,7 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : g_upscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, g_upscaleScaler, layer->colorspace );
+	layer->damage = lastCommit->damage;
 
 	if ( flags & PaintWindowFlag::NoScale )
 	{
@@ -7530,6 +7533,11 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		reslistentry.present_id,
 		reslistentry.desired_present_time,
 		reslistentry.fifo );
+
+	newCommit->damage = std::move(reslistentry.damage);
+	newCommit->damage.texture = newCommit->vulkanTex->textureID;
+	if (newCommit->vulkanTex->linearSource)
+		newCommit->vulkanTex->linearSourceDamage = newCommit->damage;
 
 	int fence = -1;
 	if ( newCommit != nullptr )

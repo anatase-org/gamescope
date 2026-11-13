@@ -2255,6 +2255,7 @@ void CVulkanCmdBuffer::discardImage(CVulkanTexture *image)
 
 void CVulkanCmdBuffer::markDirty(CVulkanTexture *image)
 {
+	++image->contentVersion;
 	auto result = m_textureState.find(image);
 	// image should have been prepared already
 	assert(result !=  m_textureState.end());
@@ -3186,6 +3187,8 @@ bool CVulkanTexture::IsInUse()
 
 CVulkanTexture::CVulkanTexture( void )
 {
+	static std::atomic<uint64_t> nextID = {0};
+	textureID = ++nextID;
 }
 
 CVulkanTexture::~CVulkanTexture( void )

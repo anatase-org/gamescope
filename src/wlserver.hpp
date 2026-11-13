@@ -21,6 +21,7 @@
 #include "vulkan_include.h"
 
 #include "steamcompmgr_shared.hpp"
+#include "SurfaceDamage.h"
 
 #if HAVE_DRM
 #define HAVE_SESSION 1
@@ -48,6 +49,7 @@ struct ResListEntry_t {
 	uint64_t desired_present_time;
 	std::shared_ptr<gamescope::CAcquireTimelinePoint> pAcquirePoint;
 	std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint;
+	SurfaceDamage damage;
 };
 
 struct wlserver_content_override;
@@ -72,7 +74,7 @@ public:
 
 	std::unique_ptr<xwayland_ctx_t> ctx;
 
-	void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf);
+	void wayland_commit(struct wlr_surface *surf, struct wlr_buffer *buf, SurfaceDamage damage);
 
 	std::vector<ResListEntry_t>& retrieve_commits();
 

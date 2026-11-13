@@ -13,6 +13,15 @@ test('frame-generation-config', test_frame_generation_config)
 test('benchmark-tools', find_program('python3', native: true),
   args: [files('test_benchmark.py')])
 
+test_surface_damage = executable(
+	'test_surface_damage',
+	'test_surface_damage.cpp',
+	include_directories: [srcdir],
+	dependencies: [wlroots_dep],
+	cpp_args: gamescope_cpp_args,
+)
+test('surface-damage', test_surface_damage)
+
 if catch2_dep.found()
 	unittest_src = []
 	foreach src : gamescope_core_src + ['Script/Script.cpp', 'convar_script.cpp']

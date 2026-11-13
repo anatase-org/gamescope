@@ -17,6 +17,7 @@
 #include "gamescope_shared.h"
 #include "backend.h"
 #include "Timeline.h"
+#include "SurfaceDamage.h"
 
 #include "shaders/descriptor_set_constants.h"
 
@@ -221,6 +222,9 @@ public:
 	uint32_t queueFamily = VK_QUEUE_FAMILY_IGNORED;
 	gamescope::OwningRc<CVulkanTexture> linearSource;
 	bool linearSourceDirty = true;
+	SurfaceDamage linearSourceDamage, sampledDamage;
+	uint64_t textureID = 0;
+	std::atomic<uint64_t> contentVersion = {0};
 	std::vector<uint16_t> uploadedLut;
 	bool identityLut = false;
 	bool blackPreservingLut = false;
@@ -334,6 +338,7 @@ struct FrameInfo_t
 	struct Layer_t
 	{
 		gamescope::Rc<CVulkanTexture> tex;
+		SurfaceDamage damage;
 		int zpos;
 
 		vec2_t offset;
