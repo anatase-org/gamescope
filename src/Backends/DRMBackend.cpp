@@ -399,6 +399,7 @@ namespace gamescope
 			std::optional<CDRMAtomicProperty> vrr_capable;
 			std::optional<CDRMAtomicProperty> EDID;
 			std::optional<CDRMAtomicProperty> Broadcast_RGB;
+			std::optional<CDRMAtomicProperty> Max_bpc;
 			std::optional<CDRMAtomicProperty> DUMMY_END;
 		};
 		      ConnectorProperties &GetProperties()       { return m_Props; }
@@ -2251,6 +2252,7 @@ namespace gamescope
 			m_Props.vrr_capable              = CDRMAtomicProperty::Instantiate( "vrr_capable",            this, *rawProperties );
 			m_Props.EDID                     = CDRMAtomicProperty::Instantiate( "EDID",                   this, *rawProperties );
 			m_Props.Broadcast_RGB            = CDRMAtomicProperty::Instantiate( "Broadcast RGB",          this, *rawProperties );
+			m_Props.Max_bpc                  = CDRMAtomicProperty::Instantiate( "max bpc",                this, *rawProperties );
 		}
 
 		ParseEDID();
@@ -3104,6 +3106,9 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 	if ( drm->pConnector && !bSleep )
 	{
+		if ( drm->is_vc4 && drm->pConnector->GetProperties().Max_bpc )
+			drm->pConnector->GetProperties().Max_bpc->SetPendingValue( drm->req, 8, bForceInRequest );
+
 		if ( drm->pConnector->GetProperties().HDR_OUTPUT_METADATA )
 			drm->pConnector->GetProperties().HDR_OUTPUT_METADATA->SetPendingValue( drm->req, pHDRMetadata ? pHDRMetadata->GetBlobValue() : 0lu, bForceInRequest );
 
@@ -3560,6 +3565,18 @@ namespace gamescope
 			else
 			{
 				drm_log.warnf( "Could not stat selected KMS device; skipping KMS PCI preference" );
+			}
+
+			if ( drmVersion *pVersion = drmGetVersion( kms_fd ) )
+			{
+				if ( pVersion->name && strcmp( pVersion->name, "vc4" ) == 0 )
+				{
+					const char *pDebug = getenv( "V3D_DEBUG" );
+					std::string debug = pDebug && *pDebug ? std::string( pDebug ) + ",disable_tfu" : "disable_tfu";
+					setenv( "V3D_DEBUG", debug.c_str(), 1 );
+					drm_log.infof( "VC4: disabling corrupting V3DV TFU transfers" );
+				}
+				drmFreeVersion( pVersion );
 			}
 
 			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
@@ -4118,7 +4135,7 @@ namespace gamescope
 
 		virtual bool SupportsPlaneHardwareCursor() const override
 		{
-			return true;
+			return !g_DRM.is_vc4;
 		}
 
 		virtual bool SupportsTearing() const override
