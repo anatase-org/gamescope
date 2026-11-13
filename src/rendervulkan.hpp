@@ -220,6 +220,7 @@ public:
 	uint32_t queueFamily = VK_QUEUE_FAMILY_IGNORED;
 	gamescope::OwningRc<CVulkanTexture> linearSource;
 	bool linearSourceDirty = true;
+	std::vector<uint16_t> uploadedLut;
 
 private:
 	bool m_bInitialized = false;

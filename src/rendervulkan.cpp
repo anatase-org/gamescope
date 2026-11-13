@@ -3470,6 +3470,16 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 	size_t lut1d_size = lut1d->width() * sizeof(uint16_t) * 4;
 	size_t lut3d_size = lut3d->width() * lut3d->height() * lut3d->depth() * sizeof(uint16_t) * 4;
 
+	const auto unchanged = [](const auto &texture, const void *data, size_t size) {
+		return texture->uploadedLut.size() * sizeof(uint16_t) == size && !memcmp(texture->uploadedLut.data(), data, size);
+	};
+	const bool changed1d = !unchanged(lut1d, lut1d_data, lut1d_size);
+	const bool changed3d = !unchanged(lut3d, lut3d_data, lut3d_size);
+	if (!changed1d && !changed3d)
+		return;
+	lut1d->uploadedLut.assign(static_cast<uint16_t *>(lut1d_data), static_cast<uint16_t *>(lut1d_data) + lut1d_size / sizeof(uint16_t));
+	lut3d->uploadedLut.assign(static_cast<uint16_t *>(lut3d_data), static_cast<uint16_t *>(lut3d_data) + lut3d_size / sizeof(uint16_t));
+
 	auto [base_dst, base_offset] = g_device.uploadBufferData(lut1d_size + lut3d_size);
 
 	void* lut1d_dst = base_dst;
@@ -3478,8 +3488,10 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 	memcpy(lut3d_dst, lut3d_data, lut3d_size);
 
 	auto cmdBuffer = g_device.commandBuffer();
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
-	cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
+	if (changed1d)
+		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset, 0, lut1d);
+	if (changed3d)
+		cmdBuffer->copyBufferToImage(g_device.uploadBuffer(), base_offset + lut1d_size, 0, lut3d);
 	g_device.submit(std::move(cmdBuffer));
 	g_device.waitIdle(); // TODO: Sync this better
 }
