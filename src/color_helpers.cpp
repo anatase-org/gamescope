@@ -725,7 +725,9 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
         glm::mat3 dest_from_xyz = glm::inverse( xyz_from_dest );
 
         glm::mat3 xyz_from_source = normalised_primary_matrix( source.primaries, source.white, 1.f );
-        glm::mat3 dest_from_source = dest_from_xyz * xyz_from_source; // XYZ scaling for white point adjustment
+        // Equal colorimetries need no matrix conversion. Avoid inverse/multiply
+        // roundoff introducing cross-channel color into otherwise separable LUTs.
+        glm::mat3 dest_from_source = source == dest ? glm::mat3(1.f) : dest_from_xyz * xyz_from_source;
 
         // Precalc night mode scalars & digital gain
         // amount and saturation are overdetermined but we separate the two as they conceptually represent

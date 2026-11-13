@@ -371,7 +371,7 @@ static const gamescope_color_mgmt_t k_ScreenshotColorMgmtHDR =
 // sudo cpupower frequency-set --governor performance
 
 static void
-create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_color_mgmt_luts outColorMgmtLuts[ EOTF_Count ])
+create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_color_mgmt_luts outColorMgmtLuts[ EOTF_Count ], bool nativeSdr = false)
 {
 	const displaycolorimetry_t& displayColorimetry = newColorMgmt.displayColorimetry;
 	const displaycolorimetry_t& outputEncodingColorimetry = newColorMgmt.outputEncodingColorimetry;
@@ -422,6 +422,13 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 				// for sdrGamutWideness indepdendent of the output encoding (for SDR data), and when mapping SDR -> PQ output
 				// we only want to utilize a portion of the gamut the actual display can reproduce
 				buildSDRColorimetry( &inputColorimetry, &colorMapping, newColorMgmt.sdrGamutWideness, displayColorimetry );
+				if (nativeSdr && newColorMgmt.outputEncodingEOTF == EOTF_Gamma22)
+				{
+					// Native SDR is the neutral setting. Night mode, gain, and white
+					// point adjustments still run, without implicit gamut emulation.
+					inputColorimetry = outputEncodingColorimetry;
+					colorMapping = {0.f, 1.f, 0.f, 0.f};
+				}
 			}
 			else if ( inputEOTF == EOTF_PQ )
 			{
@@ -469,9 +476,13 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 				buildPQColorimetry( &inputColorimetry, &colorMapping, displayColorimetry );
 			}
 
+			glm::vec2 virtualWhite = newColorMgmt.outputVirtualWhite;
+			if (nativeSdr && inputEOTF == EOTF_Gamma22 && newColorMgmt.outputEncodingEOTF == EOTF_Gamma22 &&
+				std::abs(virtualWhite.x - 0.3127f) < 0.001f && std::abs(virtualWhite.y - 0.3290f) < 0.001f)
+				virtualWhite = glm::vec2(0.0f); // Steam's neutral D65 setting is not an explicit white-point effect.
 			calcColorTransform<s_nLutEdgeSize3d>( &g_tmpLut1d, s_nLutSize1d, &g_tmpLut3d, inputColorimetry, inputEOTF,
 				outputEncodingColorimetry, newColorMgmt.outputEncodingEOTF,
-				newColorMgmt.outputVirtualWhite, newColorMgmt.chromaticAdaptationMode,
+				virtualWhite, newColorMgmt.chromaticAdaptationMode,
 				colorMapping, newColorMgmt.nightmode, tonemapping, pLook, flGain );
 
 			// Create quantized output luts
@@ -509,6 +520,8 @@ gamescope::ConVar<bool> cv_hdr_enabled{ "hdr_enabled", false, "Whether or not HD
 bool g_bHDRItmEnable = false;
 int g_nCurrentRefreshRate_CachedValue = 0;
 
+bool is_mura_correction_enabled();
+
 static void
 update_color_mgmt()
 {
@@ -537,7 +550,12 @@ update_color_mgmt()
 
 	if (g_ColorMgmt.pending.enabled)
 	{
-		create_color_mgmt_luts(g_ColorMgmt.pending, g_ColorMgmtLuts);
+		const auto look = g_ColorMgmtLooks[EOTF_Gamma22].load();
+		const float gamut = g_ColorMgmt.pending.sdrGamutWideness;
+		const bool nativeSdr = (gamut < 0.f || gamut == 0.5f) &&
+			!g_ColorMgmtLutsOverride[EOTF_Gamma22].HasLuts() && (!look || look->data.empty()) &&
+			!is_mura_correction_enabled();
+		create_color_mgmt_luts(g_ColorMgmt.pending, g_ColorMgmtLuts, nativeSdr);
 	}
 	else
 	{
