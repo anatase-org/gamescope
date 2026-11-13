@@ -1151,9 +1151,9 @@ VkSampler CVulkanDevice::sampler( SamplerState key )
 	return ret;
 }
 
-VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output)
+VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend, CompositeShaderConfig_t composite_config)
 {
-	const std::array<VkSpecializationMapEntry, 8> specializationEntries = {{
+	const std::array<VkSpecializationMapEntry, 17> specializationEntries = {{
 		{
 			.constantID = 0,
 			.offset     = sizeof(uint32_t) * 0,
@@ -1196,6 +1196,15 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 			.offset     = sizeof(uint32_t) * 7,
 			.size       = sizeof(uint32_t)
 		},
+		{ .constantID = 8, .offset = sizeof(uint32_t) * 8, .size = sizeof(uint32_t) },
+		{ .constantID = 9, .offset = sizeof(uint32_t) * 9, .size = sizeof(uint32_t) },
+		{ .constantID = 10, .offset = sizeof(uint32_t) * 10, .size = sizeof(uint32_t) },
+		{ .constantID = 11, .offset = sizeof(uint32_t) * 11, .size = sizeof(uint32_t) },
+		{ .constantID = 12, .offset = sizeof(uint32_t) * 12, .size = sizeof(uint32_t) },
+		{ .constantID = 13, .offset = sizeof(uint32_t) * 13, .size = sizeof(uint32_t) },
+		{ .constantID = 14, .offset = sizeof(uint32_t) * 14, .size = sizeof(uint32_t) },
+		{ .constantID = 15, .offset = sizeof(uint32_t) * 15, .size = sizeof(uint32_t) },
+		{ .constantID = 16, .offset = sizeof(uint32_t) * 16, .size = sizeof(uint32_t) },
 	}};
 
 	struct {
@@ -1207,6 +1216,15 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		uint32_t output_eotf;
 		uint32_t fsr_simple_output;
 		uint32_t itm_enable;
+		uint32_t workgroup_x;
+		uint32_t workgroup_y;
+		uint32_t simple_blend;
+		uint32_t filter_mask;
+		uint32_t color_mgmt_mask;
+		uint32_t sampling_mask;
+		uint32_t opaque_output;
+		uint32_t draw_layer;
+		uint32_t linear_source;
 	} specializationData = {
 		.layerCount   = layerCount,
 		.ycbcrMask    = ycbcrMask,
@@ -1216,6 +1234,15 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.output_eotf = output_eotf,
 		.fsr_simple_output = fsr_simple_output,
 		.itm_enable = itm_enable,
+		.workgroup_x = 8u,
+		.workgroup_y = 8u,
+		.simple_blend = simple_blend,
+		.filter_mask = composite_config.filterMask,
+		.color_mgmt_mask = composite_config.colorMgmtMask,
+		.sampling_mask = composite_config.samplingMask,
+		.opaque_output = composite_config.opaqueOutput,
+		.draw_layer = composite_config.drawLayer,
+		.linear_source = composite_config.linearSource,
 	};
 
 	VkSpecializationInfo specializationInfo = {
@@ -1224,6 +1251,8 @@ VkPipeline CVulkanDevice::compilePipeline(uint32_t layerCount, uint32_t ycbcrMas
 		.dataSize      = sizeof(specializationData),
 		.pData		   = &specializationData,
 	};
+
+
 
 	VkComputePipelineCreateInfo computePipelineCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -1295,18 +1324,18 @@ void CVulkanDevice::compileAllPipelines()
 
 extern bool g_bSteamIsActiveWindow;
 
-VkPipeline CVulkanDevice::pipeline(ShaderType type, uint32_t layerCount, uint32_t ycbcrMask, uint32_t blur_layers, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output)
+VkPipeline CVulkanDevice::pipeline(ShaderType type, uint32_t layerCount, uint32_t ycbcrMask, uint32_t blur_layers, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend, CompositeShaderConfig_t composite_config)
 {
 	uint32_t effective_debug = g_uCompositeDebug;
 	if ( g_bSteamIsActiveWindow )
 		effective_debug &= ~(CompositeDebugFlag::Heatmap | CompositeDebugFlag::Heatmap_MSWCG | CompositeDebugFlag::Heatmap_Hard);
 
 	std::lock_guard<std::mutex> lock(m_pipelineMutex);
-	PipelineInfo_t key = {type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output};
+	PipelineInfo_t key = {type, layerCount, ycbcrMask, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output, simple_blend, composite_config};
 	auto search = m_pipelineMap.find(key);
 	if (search == m_pipelineMap.end())
 	{
-		VkPipeline result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output);
+		VkPipeline result = compilePipeline(layerCount, ycbcrMask, type, blur_layers, effective_debug, colorspace_mask, output_eotf, itm_enable, fsr_simple_output, simple_blend, composite_config);
 		m_pipelineMap[key] = result;
 		return result;
 	}
@@ -4324,10 +4353,7 @@ struct BlitPushData_t
 			scale[i] = layer->scale;
 			offset[i] = layer->offsetPixelCenter();
 			opacity[i] = layer->opacity;
-            if (layer->isScreenSize() || (layer->filter == GamescopeUpscaleFilter::LINEAR && layer->viewConvertsToLinearAutomatically()))
-                u_shaderFilter |= ((uint32_t)GamescopeUpscaleFilter::FROM_VIEW) << (i * 4);
-            else
-                u_shaderFilter |= ((uint32_t)layer->filter) << (i * 4);
+			u_shaderFilter |= uint32_t(layer->shaderFilter()) << (i * 4);
 
 			u_alphaMode |= ((uint32_t)layer->eAlphaBlendingMode) << ( i * 4 );
 
@@ -4986,7 +5012,30 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 			cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 		} else {
-			cmdBuffer->bindPipeline( g_device.pipeline(blit_shader_for_target( compositeImage.get() ), frameInfo->layerCount, frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
+			CompositeShaderConfig_t compositeConfig;
+			compositeConfig.filterMask = compositeConfig.colorMgmtMask = 0;
+			for (int i = 0; i < frameInfo->layerCount; ++i)
+			{
+				const auto &layer = frameInfo->layers[i];
+				compositeConfig.filterMask |= uint32_t(layer.shaderFilter()) << (i * 4);
+				if (layer.ctm)
+					compositeConfig.colorMgmtMask |= 1u << i;
+			}
+			for (uint32_t i = 0; i < EOTF_Count; ++i)
+			{
+				if (frameInfo->shaperLut[i])
+				{
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + i);
+					if (frameInfo->shaperLut[i]->identityLut)
+						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + EOTF_Count + i);
+					if (frameInfo->shaperLut[i]->blackPreservingLut && frameInfo->lut3D[i] && frameInfo->lut3D[i]->blackPreservingLut)
+						compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
+				}
+				else
+					compositeConfig.colorMgmtMask |= 1u << (k_nMaxLayers + 2 * EOTF_Count + i);
+			}
+			cmdBuffer->bindPipeline(g_device.pipeline(blit_shader_for_target(compositeImage.get()), frameInfo->layerCount,
+				frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF, false, false, false, compositeConfig));
 			bind_all_layers(cmdBuffer.get(), frameInfo);
 			cmdBuffer->bindTarget(compositeImage);
 			cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);

@@ -9,6 +9,12 @@ layout(constant_id = 4) const uint c_colorspaceMask = 0;
 layout(constant_id = 5) const uint c_output_eotf = 0;
 layout(constant_id = 6) const bool c_fsr_simple_output = false;
 layout(constant_id = 7) const bool c_itm_enable = false;
+layout(constant_id = 10) const bool c_simple_blend = false;
+layout(constant_id = 11) const uint c_shaderFilterMask = 0xffffffffu;
+layout(constant_id = 12) const uint c_colorMgmtMask = 0xffffffffu;
+layout(constant_id = 13) const uint c_samplingMask = 0xffffffffu;
+layout(constant_id = 14) const bool c_opaque_output = false;
+layout(constant_id = 15) const uint c_drawLayer = 0;
 
 const int colorspace_linear = 0;
 const int colorspace_sRGB = 1;

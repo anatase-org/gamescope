@@ -385,6 +385,11 @@ struct FrameInfo_t
 				colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU;
 		}
 
+		GamescopeUpscaleFilter shaderFilter() const {
+			return isScreenSize() || ( filter == GamescopeUpscaleFilter::LINEAR && viewConvertsToLinearAutomatically() )
+				? GamescopeUpscaleFilter::FROM_VIEW : filter;
+		}
+
 		uint32_t integerWidth() const { return tex->width() / scale.x; }
 		uint32_t integerHeight() const { return tex->height() / scale.y; }
 		vec2_t offsetPixelCenter() const
@@ -709,6 +714,22 @@ namespace std
 	};
 }
 
+// UINT32_MAX preserves uniform-driven behavior for shaders outside normal blits.
+struct CompositeShaderConfig_t
+{
+	// Four filter bits per layer, matching BlitPushData_t.
+	uint32_t filterMask = UINT32_MAX;
+	// Layer CTMs followed by the EOTF LUT enables.
+	uint32_t colorMgmtMask = UINT32_MAX;
+	// Full-screen, aligned, and black-border masks, each k_nMaxLayers bits.
+	uint32_t samplingMask = UINT32_MAX;
+	bool opaqueOutput = false;
+	VkFormat renderFormat = VK_FORMAT_UNDEFINED;
+	uint32_t drawLayer = UINT32_MAX;
+	bool linearSource = false;
+	bool operator==( const CompositeShaderConfig_t & ) const = default;
+};
+
 struct PipelineInfo_t
 {
 	ShaderType shaderType;
@@ -723,6 +744,8 @@ struct PipelineInfo_t
 	uint32_t outputEOTF;
 	bool itmEnable;
 	bool fsrSimpleOutput;
+	bool simpleBlend = false;
+	CompositeShaderConfig_t compositeConfig;
 
 	bool operator==(const PipelineInfo_t& o) const {
 		return
@@ -734,7 +757,9 @@ struct PipelineInfo_t
 		colorspaceMask == o.colorspaceMask &&
 		outputEOTF == o.outputEOTF &&
 		itmEnable == o.itmEnable &&
-		fsrSimpleOutput == o.fsrSimpleOutput;
+		fsrSimpleOutput == o.fsrSimpleOutput &&
+		simpleBlend == o.simpleBlend &&
+		compositeConfig == o.compositeConfig;
 	}
 };
 
@@ -759,6 +784,14 @@ namespace std
 			hash = hash_combine(hash, k.outputEOTF);
 			hash = hash_combine(hash, k.itmEnable);
 			hash = hash_combine(hash, k.fsrSimpleOutput);
+			hash = hash_combine(hash, k.simpleBlend);
+			hash = hash_combine(hash, k.compositeConfig.filterMask);
+			hash = hash_combine(hash, k.compositeConfig.colorMgmtMask);
+			hash = hash_combine(hash, k.compositeConfig.samplingMask);
+			hash = hash_combine(hash, k.compositeConfig.opaqueOutput);
+			hash = hash_combine(hash, k.compositeConfig.renderFormat);
+			hash = hash_combine(hash, k.compositeConfig.drawLayer);
+			hash = hash_combine(hash, k.compositeConfig.linearSource);
 			return hash;
 		}
 	};
@@ -896,7 +929,7 @@ public:
 	bool BInit(VkInstance instance, VkSurfaceKHR surface);
 
 	VkSampler sampler(SamplerState key);
-	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false);
+	VkPipeline pipeline(ShaderType type, uint32_t layerCount = 1, uint32_t ycbcrMask = 0, uint32_t blur_layers = 0, uint32_t colorspace_mask = 0, uint32_t output_eotf = EOTF_Gamma22, bool itm_enable = false, bool fsr_simple_output = false, bool simple_blend = false, CompositeShaderConfig_t composite_config = {});
 	int32_t findMemoryType( VkMemoryPropertyFlags properties, uint32_t requiredTypeBits );
 	std::unique_ptr<CVulkanCmdBuffer> commandBuffer();
 	uint64_t submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuf);
@@ -973,7 +1006,7 @@ protected:
 	bool createPools();
 	bool createShaders();
 	bool createScratchResources();
-	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output);
+	VkPipeline compilePipeline(uint32_t layerCount, uint32_t ycbcrMask, ShaderType type, uint32_t blur_layer_count, uint32_t composite_debug, uint32_t colorspace_mask, uint32_t output_eotf, bool itm_enable, bool fsr_simple_output, bool simple_blend = false, CompositeShaderConfig_t composite_config = {});
 	void compileAllPipelines();
 
 	VkDevice m_device = nullptr;
