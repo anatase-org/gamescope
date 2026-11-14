@@ -232,6 +232,10 @@ def report(data):
     lines = [f"Gamescope benchmark: {data['status'].upper()}"]
     if data.get('diagnostic'):
         lines.append('DIAGNOSTIC: Wayland protocol logging enabled; timings are not comparable.')
+    if data.get('gpu_timing_available') is False:
+        lines.append('GPU timing unavailable: CPU and presentation measurements only.')
+    if data.get('active_modes'):
+        lines.append('Physical KMS modes: ' + repr(data['active_modes']))
     for key in ('host', 'revision', 'dirty_diff_sha256', 'binary_sha256'):
         if key in data:
             lines.append(f'{key}: {data[key]}')
@@ -269,7 +273,8 @@ def report(data):
         s = case['summary']; processes = s['processes']
         cpu = '/'.join(f"{processes[n]['cpu_percent']:.1f}" for n in ('gamescope', 'xwayland', 'mangoapp', 'app'))
         engines = processes['gamescope']['engines']
-        gpu = ', '.join(f"{k}={v['ms_per_second']:.1f}" for k, v in engines.items() if v['ns']) or 'idle'
+        gpu = ', '.join(f"{k}={v['ms_per_second']:.1f}" for k, v in engines.items() if v['ns']) or (
+            'unavailable' if data.get('gpu_timing_available') is False else 'idle')
         flags = ' '.join('on ' if case[k] else 'off' for k in ('overlay', 'mouse', 'night'))
         lines.append(f"{case['damage']:>3}%   {flags} | {s['presentation_fps']:5.1f}  {s['median_ms']:5.1f}/{s['p95_ms']:5.1f} {s['missed_refreshes']:7} | {cpu} | {gpu}")
         jobs = ', '.join(f"{k}: {v['jobs_per_second']:.1f} jobs/s, " +
@@ -404,6 +409,9 @@ def remote(args):
             return value if time.monotonic() - stable['since'] >= 1 else False
         display_reference = wait_for(stable_display, 'a stable connected display')
         data['displays'] = display_reference
+        # Some handhelds have no libinput devices until the fixture creates one.
+        # Make the test mouse available before Gamescope starts its backend.
+        mouse = Mouse(rate=CONFIG['mouse_rate'], radius=CONFIG['mouse_radius'], period=CONFIG['mouse_period'])
         log = open(stage / 'gamescope.log', 'w')
         arguments = ['systemd-run', '--quiet', '--unit=' + unit, '--collect', '--wait', '--pipe',
                      '-p', 'User=' + args.user, '-p', 'PAMName=login', '-p', 'TTYPath=/dev/tty1',
@@ -418,7 +426,8 @@ def remote(args):
             arguments += ['--setenv=' + setting]
         if data.get('diagnostic'):
             arguments += ['--setenv=WAYLAND_DEBUG=server']
-        arguments += ['/usr/bin/env', str(stage / 'gamescope'), '--backend', 'drm', '-w', '1920', '-h', '1080',
+        arguments += ['/usr/bin/env', str(stage / 'gamescope'), '--backend', 'drm', '--generate-drm-mode', 'fixed',
+                      '--custom-refresh-rates', '60', '-w', '1920', '-h', '1080',
                       '-W', '1920', '-H', '1080', '-r', '60', '--cursor-scale-height', '1080',
                       '--hide-cursor-delay', str(CONFIG['cursor_hide_delay_ms']),
                       '--mangoapp', '--', str(stage / 'gamescope-damage'), '--duration', '110', '--control',
@@ -443,14 +452,20 @@ def remote(args):
             connection = display.Display(fixture['display'])
         finally:
             os.seteuid(0)
+        # -r sets the client cadence; verify the physical refresh separately.
+        wait_for(lambda: active_modes() and all(mode[1] == 60 for mode in active_modes()), '60 Hz KMS output', 10)
         overlay = wait_for(overlay_window, 'MangoHud external-overlay window', max(0, startup_deadline - time.monotonic()))
         wait_for(overlay_visible, 'MangoHud first rendered frame', max(0, startup_deadline - time.monotonic()))
         data['active_modes'] = active_modes()
-        if data['active_modes'] != [['1920x1080', 60]]:
+        expected_mode = data['active_modes'] == [['1920x1080', 60]]
+        native_mode = data.get('allow_native_output') and len(data['active_modes']) == 1 and data['active_modes'][0][1] == 60
+        if not expected_mode and not native_mode:
             raise RuntimeError('unexpected active KMS modes: ' + repr(data['active_modes']))
+        if native_mode and not expected_mode:
+            data['configuration'] = dict(CONFIG, mode='1920x1080@60 SDR client; native panel at 60 Hz')
+            print('Native panel output (not an equal-resolution comparison): ' + repr(data['active_modes']), flush=True)
         print('MangoHud rendered; warming up for 10 seconds', flush=True)
         mainpid = int(output(['systemctl', 'show', unit, '-p', 'MainPID', '--value']))
-        mouse = Mouse(rate=CONFIG['mouse_rate'], radius=CONFIG['mouse_radius'], period=CONFIG['mouse_period'])
         state(50, True, True, True)
         pause(CONFIG['warmup_seconds'])
         children = descendants(mainpid)
@@ -470,7 +485,8 @@ def remote(args):
         data['discovered_processes'] = children
         if any(not value for value in groups.values()):
             raise RuntimeError('missing benchmark process group: ' + repr(groups))
-        if not any(gpu_counters(mainpid).values()):
+        data['gpu_timing_available'] = any(gpu_counters(mainpid).values())
+        if not data['gpu_timing_available'] and not data.get('allow_missing_gpu_timing'):
             raise RuntimeError('GPU fdinfo timing counters unavailable')
         data['process_groups'] = groups
         trace = Trace(unit)
@@ -552,7 +568,8 @@ def local(args):
     destination = Path(args.result).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     data = {'status': 'failed', 'results': [], 'host': args.host, 'configuration': CONFIG,
-            'diagnostic': args.diagnose_damage}
+            'diagnostic': args.diagnose_damage, 'allow_native_output': args.allow_native_output,
+            'allow_missing_gpu_timing': args.allow_missing_gpu_timing}
     stage = None; ssh = None; stopped = threading.Event()
     try:
         data['revision'] = output(['git', 'rev-parse', 'HEAD'])
@@ -623,6 +640,8 @@ def main():
     p = commands.add_parser('local')
     p.add_argument('--host', required=True); p.add_argument('--result', required=True); p.add_argument('--build-dir', required=True)
     p.add_argument('--diagnose-damage', action='store_true', help='log Wayland damage separately; not a performance comparison')
+    p.add_argument('--allow-native-output', action='store_true', help='allow a native panel size with the same 60 Hz client workload; record the physical mode')
+    p.add_argument('--allow-missing-gpu-timing', action='store_true', help='collect CPU/presentation results when the driver exposes no GPU time counters')
     p = commands.add_parser('remote')
     p.add_argument('--stage', required=True); p.add_argument('--user', required=True)
     p = commands.add_parser('failure')

@@ -55,6 +55,18 @@ class BenchmarkTests(unittest.TestCase):
             self.assertIn('FAILED', path.read_text())
             self.assertEqual(json.loads(Path(str(path) + '.json').read_text())['status'], 'failed')
 
+    def test_report_marks_native_output_and_missing_gpu_timing(self):
+        summary = benchmark.summarize(self.before, self.after, 2, self.events)
+        process = dict(summary['processes']['gamescope'], engines={})
+        summary['processes'] = {name: process for name in ('gamescope', 'xwayland', 'mangoapp', 'app')}
+        text = benchmark.report({'status': 'complete', 'active_modes': [['1920x1200', 60]],
+                                 'gpu_timing_available': False, 'results': [dict(
+                                     damage=50, overlay=False, mouse=False, night=False, summary=summary)]})
+        self.assertIn('1920x1200', text)
+        self.assertIn('CPU and presentation measurements only', text)
+        self.assertIn('unavailable', text)
+        self.assertNotIn('idle', text)
+
     def test_sync_rejects_arguments_before_connecting(self):
         for args in [['--test'], ['--test', ''], ['--test', 'result.txt', '--appid', '1', 'pi']]:
             result = subprocess.run(['sh', str(ROOT / 'sync.sh'), *args], capture_output=True)
