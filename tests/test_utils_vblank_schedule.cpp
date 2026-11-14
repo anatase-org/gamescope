@@ -182,3 +182,20 @@ TEST_CASE("High nested rates bound a draw lead longer than one interval", "[vbla
 	REQUIRE(next.ulTargetVBlank == 1'001'000'000);
 	REQUIRE(next.ulScheduledWakeupPoint == 1'000'000'000);
 }
+
+TEST_CASE("A late unconsumed wake stays eligible within the compositing margin", "[vblank_schedule]") {
+	VBlank::ScheduleParams params{
+		.ulLastVBlank = 1'000'000'000,
+		.ulInterval = 16'666'667,
+		.ulOffset = 2'000'000,
+		.ulNow = 1'015'000'000,
+		.ulLateMargin = 650'000,
+	};
+	const auto late = VBlank::Next(params, {});
+	REQUIRE(late.ulScheduledWakeupPoint == 1'014'666'667);
+	// The margin must never make an accepted target eligible a second time.
+	const auto next = VBlank::Next(params, late);
+	REQUIRE(next.ulTargetVBlank == 1'033'333'334);
+	params.ulNow = 1'015'400'000;
+	REQUIRE(VBlank::Next(params, {}).ulTargetVBlank == next.ulTargetVBlank);
+}
