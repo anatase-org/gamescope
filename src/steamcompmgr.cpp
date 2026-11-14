@@ -3035,7 +3035,8 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 	struct FrameInfo_t frameInfo = {};
 	frameInfo.applyOutputColorMgmt = g_ColorMgmt.pending.enabled;
 	frameInfo.outputEncodingEOTF = g_ColorMgmt.pending.outputEncodingEOTF;
-	frameInfo.allowVRR = cv_adaptive_sync;
+	// Keep the launcher (app ID 769) at fixed refresh.
+	frameInfo.allowVRR = cv_adaptive_sync && !window_is_steam( w );
 	frameInfo.bFadingOut = fadingOut;
 	frameInfo.dpms = dpms;
 	frameInfo.eUpscaleFilter = pFocus->eUpscaleFilter;
