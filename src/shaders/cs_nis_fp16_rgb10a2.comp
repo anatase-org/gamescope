@@ -1,0 +1,10 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : enable
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define NIS_USE_HALF_PRECISION 1
+#define VKR_TARGET_FORMAT rgb10_a2
+
+#include "nis.h"

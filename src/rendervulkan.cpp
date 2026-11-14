@@ -68,6 +68,48 @@
 #include "cs_nis_hdr_linear_fp16.h"
 #include "cs_rgb_to_nv12.h"
 #include "cs_sgsr.h"
+#include "cs_composite_blur_rgba16f.h"
+#include "cs_composite_blur_rgb10a2.h"
+#include "cs_composite_blur_cond_rgba16f.h"
+#include "cs_composite_blur_cond_rgb10a2.h"
+#include "cs_gaussian_blur_horizontal_rgba16f.h"
+#include "cs_gaussian_blur_horizontal_rgb10a2.h"
+#include "cs_composite_blit_rgba16f.h"
+#include "cs_nis_rgb10a2.h"
+#include "cs_nis_fp16_rgb10a2.h"
+#include "cs_composite_blit_formatless.h"
+#include "cs_composite_blit_rgb10a2_formatless.h"
+#include "cs_composite_blur_formatless.h"
+#include "cs_composite_blur_cond_formatless.h"
+#include "cs_composite_rcas_formatless.h"
+#include "cs_composite_rcas_1px_formatless.h"
+#include "cs_composite_rcas_fp16_formatless.h"
+#include "cs_composite_rcas_fp16_1px_formatless.h"
+#include "cs_composite_rcas_rgba16f_formatless.h"
+#include "cs_composite_rcas_rgba16f_1px_formatless.h"
+#include "cs_composite_rcas_rgb10a2_formatless.h"
+#include "cs_composite_rcas_rgb10a2_1px_formatless.h"
+#include "cs_easu_formatless.h"
+#include "cs_easu_fp16_formatless.h"
+#include "cs_easu_rgba16f_formatless.h"
+#include "cs_easu_fp16_rgba16f_formatless.h"
+#include "cs_gaussian_blur_horizontal_formatless.h"
+#include "cs_nis_formatless.h"
+#include "cs_nis_fp16_formatless.h"
+#include "cs_nis_hdr_linear_formatless.h"
+#include "cs_nis_hdr_linear_fp16_formatless.h"
+#include "cs_rgb_to_nv12_formatless.h"
+#include "cs_sgsr_formatless.h"
+#include "cs_composite_blur_rgba16f_formatless.h"
+#include "cs_composite_blur_rgb10a2_formatless.h"
+#include "cs_composite_blur_cond_rgba16f_formatless.h"
+#include "cs_composite_blur_cond_rgb10a2_formatless.h"
+#include "cs_gaussian_blur_horizontal_rgba16f_formatless.h"
+#include "cs_gaussian_blur_horizontal_rgb10a2_formatless.h"
+#include "cs_composite_blit_rgba16f_formatless.h"
+#include "cs_nis_rgb10a2_formatless.h"
+#include "cs_nis_fp16_rgb10a2_formatless.h"
+
 
 gamescope::ConVar<bool> cv_raster_damage("raster_damage", true, "Reuse input shadows and output contents outside client damage.");
 
@@ -1026,12 +1068,15 @@ bool CVulkanDevice::createLayouts()
 		return false;
 	}
 
-	VkPushConstantRange linearSourceRange = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 5 * sizeof(uint32_t)};
+	VkPushConstantRange ranges[] = {
+		{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 5 * sizeof(uint32_t)},
+		{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t)},
+	};
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = 1,
 		.pSetLayouts = &m_descriptorSetLayout,
-		.pushConstantRangeCount = 1, .pPushConstantRanges = &linearSourceRange,
+		.pushConstantRangeCount = 2, .pPushConstantRanges = ranges,
 	};
 	
 	res = vk.CreatePipelineLayout(device(), &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
@@ -1140,12 +1185,19 @@ bool CVulkanDevice::createShaders()
 	};
 
 	std::array<ShaderInfo_t, SHADER_TYPE_COUNT> shaderInfos;
-#define SHADER(type, array) shaderInfos[SHADER_TYPE_##type] = {array , sizeof(array)}
+#define SHADER(type, array) shaderInfos[SHADER_TYPE_##type] = m_bSupportsStorageImageWriteWithoutFormat ? ShaderInfo_t{array##_formatless, sizeof(array##_formatless)} : ShaderInfo_t{array, sizeof(array)}
 	SHADER(BLIT, cs_composite_blit);
+	SHADER(BLIT_RGBA16F, cs_composite_blit_rgba16f);
 	SHADER(BLIT_RGB10A2, cs_composite_blit_rgb10a2);
 	SHADER(BLUR, cs_composite_blur);
+	SHADER(BLUR_RGB10A2, cs_composite_blur_rgb10a2);
+	SHADER(BLUR_RGBA16F, cs_composite_blur_rgba16f);
 	SHADER(BLUR_COND, cs_composite_blur_cond);
+	SHADER(BLUR_COND_RGB10A2, cs_composite_blur_cond_rgb10a2);
+	SHADER(BLUR_COND_RGBA16F, cs_composite_blur_cond_rgba16f);
 	SHADER(BLUR_FIRST_PASS, cs_gaussian_blur_horizontal);
+	SHADER(BLUR_FIRST_PASS_RGB10A2, cs_gaussian_blur_horizontal_rgb10a2);
+	SHADER(BLUR_FIRST_PASS_RGBA16F, cs_gaussian_blur_horizontal_rgba16f);
 	if ( m_uVendorID == 0x5143 ) /* Qualcomm */
 	{
 		SHADER(RCAS, cs_composite_rcas_1px);
@@ -1183,6 +1235,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(EASU, cs_easu_fp16);
 		SHADER(EASU_RGBA16F, cs_easu_fp16_rgba16f);
 		SHADER(NIS, cs_nis_fp16);
+		SHADER(NIS_RGB10A2, cs_nis_fp16_rgb10a2);
 		SHADER(NIS_HDR_LINEAR, cs_nis_hdr_linear_fp16);
 	}
 	else
@@ -1191,6 +1244,7 @@ bool CVulkanDevice::createShaders()
 		SHADER(EASU, cs_easu);
 		SHADER(EASU_RGBA16F, cs_easu_rgba16f);
 		SHADER(NIS, cs_nis);
+		SHADER(NIS_RGB10A2, cs_nis_rgb10a2);
 		SHADER(NIS_HDR_LINEAR, cs_nis_hdr_linear);
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
@@ -1516,10 +1570,17 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	std::array<PipelineInfo_t, SHADER_TYPE_COUNT> pipelineInfos;
 #define SHADER(type, layer_count, max_ycbcr, blur_layers) pipelineInfos[SHADER_TYPE_##type] = {SHADER_TYPE_##type, layer_count, max_ycbcr, blur_layers}
 	SHADER(BLIT, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
+	SHADER(BLIT_RGBA16F, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(BLIT_RGB10A2, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(BLUR, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
+	SHADER(BLUR_RGB10A2, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
+	SHADER(BLUR_RGBA16F, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
 	SHADER(BLUR_COND, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
+	SHADER(BLUR_COND_RGB10A2, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
+	SHADER(BLUR_COND_RGBA16F, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, k_nMaxBlurLayers);
 	SHADER(BLUR_FIRST_PASS, 1, 2, 1);
+	SHADER(BLUR_FIRST_PASS_RGB10A2, 1, 2, 1);
+	SHADER(BLUR_FIRST_PASS_RGBA16F, 1, 2, 1);
 	SHADER(RCAS, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(RCAS_FP16, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
 	SHADER(RCAS_RGBA16F, k_nMaxLayers, k_nMaxYcbcrMask_ToPreCompile, 1);
@@ -1527,6 +1588,7 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	SHADER(EASU, 1, 1, 1);
 	SHADER(EASU_RGBA16F, 1, 1, 1);
 	SHADER(NIS, 1, 1, 1);
+	SHADER(NIS_RGB10A2, 1, 1, 1);
 	SHADER(NIS_HDR_LINEAR, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
 
@@ -2099,6 +2161,8 @@ void CVulkanCmdBuffer::dispatch(uint32_t x, uint32_t y, uint32_t z)
 	insertBarrier();
 
 	bindDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE);
+	const uint32_t storeBgra = m_target->storageViewSwapsRB();
+	m_device->vk.CmdPushConstants(m_cmdBuffer, m_device->pipelineLayout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(storeBgra), &storeBgra);
 	m_device->vk.CmdDispatch(m_cmdBuffer, x, y, z);
 	markDirty(m_target);
 }
@@ -2244,7 +2308,7 @@ void CVulkanCmdBuffer::bindDescriptors(VkPipelineBindPoint bindPoint, CVulkanTex
 	}
 	else if (!m_target->isYcbcr())
 	{
-		targetDescriptors[0].imageView = m_target->srgbView();
+		targetDescriptors[0].imageView = m_target->storageView();
 		targetDescriptors[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	}
 	else
@@ -2766,6 +2830,41 @@ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
 	}
 }
 
+static VkFormat typed_storage_view_format( VkFormat format )
+{
+	format = ToLinearVulkanFormat( format );
+	if ( g_device.supportsStorageImageWriteWithoutFormat() )
+		return format;
+	if ( format == VK_FORMAT_B8G8R8A8_UNORM )
+		return VK_FORMAT_R8G8B8A8_UNORM;
+	if ( format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 )
+		return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+	return format;
+}
+
+bool CVulkanTexture::BInitStorageView()
+{
+	const VkFormat format = typed_storage_view_format( m_format );
+	if ( format == ToLinearVulkanFormat( m_format ) )
+		return true;
+	VkImageViewUsageCreateInfo usage = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+		.usage = VK_IMAGE_USAGE_STORAGE_BIT,
+	};
+	VkImageViewCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.pNext = &usage,
+		.image = m_vkImage,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = format,
+		.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	VkResult res = g_device.vk.CreateImageView(g_device.device(), &info, nullptr, &m_storageView);
+	if ( res != VK_SUCCESS )
+		vk_errorf(res, "vkCreateImageView for typed storage failed");
+	return res == VK_SUCCESS;
+}
+
 bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA /* = nullptr */,  uint32_t contentWidth /* = 0 */, uint32_t contentHeight /* =  0 */, CVulkanTexture *pExistingImageToReuseMemory, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
 {
 	m_pBackendFb = std::move( pBackendFb );
@@ -2866,10 +2965,13 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	assert( imageInfo.format != VK_FORMAT_UNDEFINED );
 
-	std::array<VkFormat, 2> formats = {
+	std::vector<VkFormat> formats = {
 		DRMFormatToVulkan(drmFormat, false),
 		DRMFormatToVulkan(drmFormat, true),
 	};
+
+	if ( flags.bStorage && typed_storage_view_format(imageInfo.format) != imageInfo.format )
+		formats.push_back(typed_storage_view_format(imageInfo.format));
 
 	VkImageFormatListCreateInfo formatList = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
@@ -2877,7 +2979,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		.pViewFormats = formats.data(),
 	};
 
-	if ( formats[0] != formats[1] )
+	if ( formats[0] != formats[1] || formats.size() > 2 )
 	{
 		formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
 		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -3330,6 +3432,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			return false;
 		}
 
+		if ( flags.bStorage && !BInitStorageView() )
+			return false;
+
 		if ( flags.bSampled || flags.bColorAttachment )
 		{
 			VkImageViewUsageCreateInfo viewUsageInfo = {
@@ -3503,6 +3608,9 @@ bool CVulkanTexture::BInitFromSwapchain( VkImage image, uint32_t width, uint32_t
 		return false;
 	}
 
+	if ( !BInitStorageView() )
+		return false;
+
 	VkImageViewUsageCreateInfo viewUsageInfo = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
 		.usage = VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -3653,6 +3761,11 @@ CVulkanTexture::~CVulkanTexture( void )
 		m_pMappedData = nullptr;
 	}
 
+	if ( m_storageView != VK_NULL_HANDLE )
+	{
+		g_device.vk.DestroyImageView( g_device.device(), m_storageView, nullptr );
+		m_storageView = VK_NULL_HANDLE;
+	}
 	if ( m_srgbView != VK_NULL_HANDLE )
 	{
 		g_device.vk.DestroyImageView( g_device.device(), m_srgbView, nullptr );
@@ -3793,7 +3906,7 @@ bool vulkan_init_format(VkFormat format, uint32_t drmFormat)
 		.usage = VK_IMAGE_USAGE_SAMPLED_BIT,
 	};
 
-	std::array<VkFormat, 2> formats = {
+	std::vector<VkFormat> formats = {
 		DRMFormatToVulkan(drmFormat, false),
 		DRMFormatToVulkan(drmFormat, true),
 	};
@@ -3804,7 +3917,7 @@ bool vulkan_init_format(VkFormat format, uint32_t drmFormat)
 		.pViewFormats = formats.data(),
 	};
 
-	if ( formats[0] != formats[1] )
+	if ( formats[0] != formats[1] || formats.size() > 2 )
 	{
 		formatList.pNext = std::exchange(imageFormatInfo.pNext,
 						 &formatList);
@@ -4299,24 +4412,27 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 	VkFormat eVkFormat = pOutput->surfaceFormats[ surfaceFormat ].format;
 	pOutput->uOutputFormat = VulkanFormatToDRM( pOutput->surfaceFormats[ surfaceFormat ].format );
 	
-	VkFormat formats[2] =
+	std::vector<VkFormat> formats =
 	{
 		ToSrgbVulkanFormat( eVkFormat ),
 		ToLinearVulkanFormat( eVkFormat ),
 	};
 
+	if ( typed_storage_view_format(eVkFormat) != ToLinearVulkanFormat(eVkFormat) )
+		formats.push_back(typed_storage_view_format(eVkFormat));
+
 	VkImageFormatListCreateInfo usageListInfo = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
-		.viewFormatCount = 2,
-		.pViewFormats = formats,
+		.viewFormatCount = uint32_t(formats.size()),
+		.pViewFormats = formats.data(),
 	};
 
 	vk_log.infof("Creating Gamescope nested swapchain with format %u and colorspace %u", eVkFormat, pOutput->surfaceFormats[surfaceFormat].colorSpace);
 
 	VkSwapchainCreateInfoKHR createInfo = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-		.pNext = formats[0] != formats[1] ? &usageListInfo : nullptr,
-		.flags = formats[0] != formats[1] ? VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR : (VkSwapchainCreateFlagBitsKHR )0,
+		.pNext = (formats[0] != formats[1] || formats.size() > 2) ? &usageListInfo : nullptr,
+		.flags = (formats[0] != formats[1] || formats.size() > 2) ? VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR : (VkSwapchainCreateFlagBitsKHR )0,
 		.surface = pOutput->surface,
 		.minImageCount = imageCount,
 		.imageFormat = eVkFormat,
@@ -5358,15 +5474,34 @@ static bool is_fp16_fsr_target( const CVulkanTexture *texture )
 
 static bool is_rgb10a2_target( const CVulkanTexture *texture )
 {
-	// GLSL's rgb10_a2 storage format maps to Vulkan's A2B10G10R10 view.
-	return texture->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+	// BGR targets use a compatible RGB view for typed stores.
+	return texture->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+	       texture->format() == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
 }
 
 static ShaderType blit_shader_for_target( const CVulkanTexture *texture )
 {
-	return is_rgb10a2_target( texture )
-		? SHADER_TYPE_BLIT_RGB10A2
-		: SHADER_TYPE_BLIT;
+	return is_fp16_fsr_target(texture) ? SHADER_TYPE_BLIT_RGBA16F :
+	       is_rgb10a2_target(texture) ? SHADER_TYPE_BLIT_RGB10A2 : SHADER_TYPE_BLIT;
+}
+
+static uint32_t tmp_image_format( const FrameInfo_t *frame )
+{
+	switch ( frame->layers[0].colorspace )
+	{
+	case GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB: return DRM_FORMAT_ABGR16161616F;
+	case GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ: return DRM_FORMAT_ABGR2101010;
+	default: return DRM_FORMAT_ARGB8888;
+	}
+}
+
+static ShaderType blur_shader_for_target( ShaderType type, const CVulkanTexture *target )
+{
+	if ( type == SHADER_TYPE_BLUR_FIRST_PASS )
+		return is_fp16_fsr_target(target) ? SHADER_TYPE_BLUR_FIRST_PASS_RGBA16F : is_rgb10a2_target(target) ? SHADER_TYPE_BLUR_FIRST_PASS_RGB10A2 : type;
+	if ( type == SHADER_TYPE_BLUR_COND )
+		return is_fp16_fsr_target(target) ? SHADER_TYPE_BLUR_COND_RGBA16F : is_rgb10a2_target(target) ? SHADER_TYPE_BLUR_COND_RGB10A2 : type;
+	return is_fp16_fsr_target(target) ? SHADER_TYPE_BLUR_RGBA16F : is_rgb10a2_target(target) ? SHADER_TYPE_BLUR_RGB10A2 : type;
 }
 
 static bool can_use_simple_fsr_output( const FrameInfo_t *frameInfo, CVulkanTexture *output, EOTF outputTF )
@@ -5670,14 +5805,14 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		uint32_t tempX = frameInfo->layers.get( 0 ).integerWidth();
 		uint32_t tempY = frameInfo->layers.get( 0 ).integerHeight();
 
-		update_tmp_images(tempX, tempY);
+		update_tmp_images(tempX, tempY, tmp_image_format(frameInfo));
 
 		float nisSharpness = (20 - frameInfo->nUpscaleSharpness) / 20.0f;
 
 		// The SDR luma ramp bottoms out at 0.9, which is 72 nits in scRGB.
 		const bool bNisLinearHdr = frameInfo->layers.get( 0 ).colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
 
-		cmdBuffer->bindPipeline(g_device.pipeline(bNisLinearHdr ? SHADER_TYPE_NIS_HDR_LINEAR : SHADER_TYPE_NIS));
+		cmdBuffer->bindPipeline(g_device.pipeline(bNisLinearHdr ? SHADER_TYPE_NIS_HDR_LINEAR : is_rgb10a2_target(g_output.tmpOutput.get()) ? SHADER_TYPE_NIS_RGB10A2 : SHADER_TYPE_NIS));
 		cmdBuffer->bindTarget(g_output.tmpOutput);
 		cmdBuffer->bindTexture(0, frameInfo->layers.get( 0 ).tex);
 		cmdBuffer->setTextureSrgb(0, true);
@@ -5716,9 +5851,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	}
 	else if ( frameInfo->blurLayer0 )
 	{
-		update_tmp_images(currentOutputWidth, currentOutputHeight);
+		update_tmp_images(currentOutputWidth, currentOutputHeight, tmp_image_format(frameInfo));
 
-		ShaderType type = SHADER_TYPE_BLUR_FIRST_PASS;
+		ShaderType type = blur_shader_for_target(SHADER_TYPE_BLUR_FIRST_PASS, g_output.tmpOutput.get());
 
 		uint32_t blur_layer_count = 1;
 		// Also blur the override on top if we have one.
@@ -5746,7 +5881,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 		bool useSrgbView = frameInfo->layers.get( 0 ).colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_LINEAR;
 
-		type = frameInfo->blurLayer0 == BLUR_MODE_COND ? SHADER_TYPE_BLUR_COND : SHADER_TYPE_BLUR;
+		type = blur_shader_for_target(frameInfo->blurLayer0 == BLUR_MODE_COND ? SHADER_TYPE_BLUR_COND : SHADER_TYPE_BLUR, compositeImage.get());
 		cmdBuffer->bindPipeline(g_device.pipeline(type, frameInfo->layers.count(), frameInfo->ycbcrMask(), blur_layer_count, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 
@@ -5848,7 +5983,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			for (uint32_t i = 0; i < EOTF_Count; i++)
 				cmdBuffer->bindColorMgmtLuts(i, nullptr, nullptr);
 
-			cmdBuffer->bindPipeline(g_device.pipeline( ycbcr ? SHADER_TYPE_RGB_TO_NV12 : SHADER_TYPE_BLIT, 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count ));
+			cmdBuffer->bindPipeline(g_device.pipeline( ycbcr ? SHADER_TYPE_RGB_TO_NV12 : blit_shader_for_target(pPipewireTexture.get()), 1, 0, 0, GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB, EOTF_Count ));
 			cmdBuffer->bindTexture(0, compositeImage);
 			cmdBuffer->setTextureSrgb(0, true);
 			cmdBuffer->setSamplerNearest(0, false);

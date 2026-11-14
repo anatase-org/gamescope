@@ -179,6 +179,8 @@ public:
 	inline VkImageView view( bool linear ) { return linear ? m_linearView : m_srgbView; }
 	inline VkImageView linearView() { return m_linearView; }
 	inline VkImageView srgbView() { return m_srgbView; }
+	inline VkImageView storageView() { return m_storageView ? m_storageView : m_srgbView; }
+	inline bool storageViewSwapsRB() const { return m_storageView != VK_NULL_HANDLE; }
 	inline VkImageView lumaView() { return m_lumaView; }
 	inline VkImageView chromaView() { return m_chromaView; }
 	inline uint32_t width() { return m_width; }
@@ -253,6 +255,8 @@ private:
 	VkImage m_vkImage = VK_NULL_HANDLE;
 	VkDeviceMemory m_vkImageMemory = VK_NULL_HANDLE;
 	
+	bool BInitStorageView();
+	VkImageView m_storageView = VK_NULL_HANDLE;
 	VkImageView m_srgbView = VK_NULL_HANDLE;
 	VkImageView m_linearView = VK_NULL_HANDLE;
 
@@ -742,10 +746,17 @@ struct VulkanOutput_t
 
 enum ShaderType {
 	SHADER_TYPE_BLIT = 0,
+	SHADER_TYPE_BLIT_RGBA16F,
 	SHADER_TYPE_BLIT_RGB10A2,
 	SHADER_TYPE_BLUR,
+	SHADER_TYPE_BLUR_RGB10A2,
+	SHADER_TYPE_BLUR_RGBA16F,
 	SHADER_TYPE_BLUR_COND,
+	SHADER_TYPE_BLUR_COND_RGB10A2,
+	SHADER_TYPE_BLUR_COND_RGBA16F,
 	SHADER_TYPE_BLUR_FIRST_PASS,
+	SHADER_TYPE_BLUR_FIRST_PASS_RGB10A2,
+	SHADER_TYPE_BLUR_FIRST_PASS_RGBA16F,
 	SHADER_TYPE_EASU,
 	SHADER_TYPE_EASU_RGBA16F,
 	SHADER_TYPE_RCAS,
@@ -753,6 +764,7 @@ enum ShaderType {
 	SHADER_TYPE_RCAS_RGBA16F,
 	SHADER_TYPE_RCAS_RGB10A2,
 	SHADER_TYPE_NIS,
+	SHADER_TYPE_NIS_RGB10A2,
 	SHADER_TYPE_NIS_HDR_LINEAR,
 	SHADER_TYPE_RGB_TO_NV12,
 	SHADER_TYPE_SGSR,

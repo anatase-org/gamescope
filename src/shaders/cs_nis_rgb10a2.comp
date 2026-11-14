@@ -1,0 +1,7 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : enable
+
+#define VKR_TARGET_FORMAT rgb10_a2
+
+#include "nis.h"

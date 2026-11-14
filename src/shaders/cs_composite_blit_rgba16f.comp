@@ -1,0 +1,9 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : enable
+
+#extension GL_EXT_scalar_block_layout : require
+
+#define VKR_TARGET_FORMAT rgba16f
+
+#include "cs_composite_blit_common.h"

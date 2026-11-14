@@ -56,10 +56,22 @@ uint get_layer_colorspace(uint layerIdx) {
 #define VKR_TARGET_FORMAT rgba8
 #endif
 
+#ifdef VKR_FORMATLESS
+layout(binding = 1) writeonly uniform image2D dst;
+layout(binding = 1) writeonly uniform image2D dst_luma;
+layout(binding = 2) writeonly uniform image2D dst_chroma;
+#else
 layout(binding = 1, VKR_TARGET_FORMAT) writeonly uniform image2D dst;
-// alias
-layout(binding = 1, VKR_TARGET_FORMAT) writeonly uniform image2D dst_luma;
-layout(binding = 2, VKR_TARGET_FORMAT) writeonly uniform image2D dst_chroma;
+layout(binding = 1, r8) writeonly uniform image2D dst_luma;
+layout(binding = 2, rg8) writeonly uniform image2D dst_chroma;
+#ifndef VKR_FRAGMENT
+// BGR outputs use a compatible RGB storage view on devices requiring typed
+// stores. Swap components at the store, leaving sampling/color work unchanged.
+layout(push_constant) uniform StorageOutputData { uint u_storeBgra; };
+vec4 storageOutput(vec4 value) { return u_storeBgra != 0u ? value.bgra : value; }
+#define imageStore(image, coord, value) imageStore(image, coord, storageOutput(value))
+#endif
+#endif
 
 layout(binding = 3) uniform sampler2D s_samplers[VKR_SAMPLER_SLOTS];
 layout(binding = 4) uniform sampler2D s_ycbcr_samplers[VKR_SAMPLER_SLOTS];

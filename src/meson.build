@@ -87,9 +87,32 @@ shader_src = [
   'shaders/cs_nis_hdr_linear_fp16.comp',
   'shaders/cs_rgb_to_nv12.comp',
   'shaders/cs_sgsr.comp',
+  'shaders/cs_composite_blur_rgba16f.comp',
+  'shaders/cs_composite_blur_rgb10a2.comp',
+  'shaders/cs_composite_blur_cond_rgba16f.comp',
+  'shaders/cs_composite_blur_cond_rgb10a2.comp',
+  'shaders/cs_gaussian_blur_horizontal_rgba16f.comp',
+  'shaders/cs_gaussian_blur_horizontal_rgb10a2.comp',
+  'shaders/cs_composite_blit_rgba16f.comp',
+  'shaders/cs_nis_rgb10a2.comp',
+  'shaders/cs_nis_fp16_rgb10a2.comp',
+
 ]
 
-spirv_shaders = glsl_generator.process(shader_src)
+spirv_shaders = [glsl_generator.process(shader_src)]
+
+# Keep typed shaders for GPUs without shaderStorageImageWriteWithoutFormat.
+formatless_generator = generator(
+  glsl_compiler,
+  output: ['@BASENAME@_formatless.h'],
+  arguments: ['-V', '-Os', '-DVKR_FORMATLESS=1', '@INPUT@', '--vn', '@BASENAME@_formatless', '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', '--quiet'],
+  depfile: '@BASENAME@_formatless.h.d',
+)
+foreach shader : shader_src
+  if shader.startswith('shaders/cs_')
+    spirv_shaders += [formatless_generator.process(shader)]
+  endif
+endforeach
 
 # FidelityFX SDK 1.1.4 is the last upstream SDK release with maintained
 # Vulkan/GLSL frame-generation shaders. Keep these as standalone shader

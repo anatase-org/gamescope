@@ -1,0 +1,6 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+
+#define VKR_TARGET_FORMAT rgb10_a2
+#include "cs_gaussian_blur_horizontal.h"
