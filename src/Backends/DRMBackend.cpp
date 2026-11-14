@@ -130,12 +130,14 @@ struct drm_t {
 	struct wlr_drm_format_set formats;
 	bool is_nvidia = false;
 	bool is_vc4 = false;
+	bool is_intel = false;
 	bool generic_plane_color = false;
 	std::map<uint32_t, std::vector<drm_color::Pipeline>> color_pipelines;
 	std::map<std::vector<uint64_t>, std::vector<DRMColorCandidate>> color_program_cache;
 	std::map<std::vector<uint64_t>, std::optional<drm_color::CrtcProgram>> color_output_cache;
 	std::set<std::vector<uint64_t>> color_failed_frames;
 	std::vector<uint64_t> color_last_roots;
+	std::vector<uint64_t> color_reported_program;
 	std::string color_failure;
 	uint32_t color_cache_serial = 0;
 #if HAVE_GBM
@@ -1657,10 +1659,12 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 
 	drm->is_nvidia = false;
 	drm->is_vc4 = false;
+	drm->is_intel = false;
 	if ( drmVersion *pVersion = drmGetVersion( drm->fd ) )
 	{
 		drm->is_nvidia = pVersion->name && strcmp( pVersion->name, "nvidia-drm" ) == 0;
 		drm->is_vc4 = pVersion->name && strcmp( pVersion->name, "vc4" ) == 0;
+		drm->is_intel = pVersion->name && (strcmp(pVersion->name, "i915") == 0 || strcmp(pVersion->name, "xe") == 0);
 		drmFreeVersion( pVersion );
 	}
 
@@ -2031,6 +2035,7 @@ void finish_drm(struct drm_t *drm)
 	drm->color_output_cache.clear();
 	drm->color_failed_frames.clear();
 	drm->color_last_roots.clear();
+	drm->color_reported_program.clear();
 	drm->color_pipelines.clear();
 	drm->current = drm_t::drm_state_t{};
 	drm->pending = drm_t::drm_state_t{};
@@ -3106,7 +3111,11 @@ static void drm_init_generic_color(struct drm_t *drm)
 						if (value == type->second.value) typeName = label;
 					const uint32_t operationId = id;
 					id = next->second.value;
-					pipeline.operations.push_back({operationId, typeName, std::move(props)});
+					// Intel's xelpd_program_plane_{pre,post}_csc_lut loaders
+					// program only the green entries as a curve shared by RGB.
+					// The colorop UAPI does not advertise this restriction.
+					const bool singleChannel = drm->is_intel && typeName == "1D LUT";
+					pipeline.operations.push_back({operationId, typeName, std::move(props), singleChannel});
 				}
 				if (drm_color::ValidPipeline(pipeline))
 					drm->color_pipelines[plane->GetObjectId()].push_back(std::move(pipeline));
@@ -3178,7 +3187,7 @@ static int drm_prepare_generic_color(struct drm_t *drm, const FrameInfo_t *frame
 	{
 		if (drm->color_failure != reason)
 		{
-			drm_log.debugf("Color scanout requires composition: %s", reason);
+			drm_log.infof("Color scanout requires composition: %s", reason);
 			drm->color_failure = reason;
 		}
 		return -EINVAL;
@@ -3397,6 +3406,20 @@ static int drm_prepare_generic_color(struct drm_t *drm, const FrameInfo_t *frame
 	if (result == -EINVAL && is_liftoff_caching_enabled()) drm->color_failed_frames.insert(std::move(frameKey));
 	drmModeAtomicSetCursor(drm->req, cursor);
 	return reject("atomic testing rejected all compatible color pipeline mappings");
+}
+
+static void drm_report_generic_color_scanout(struct drm_t *drm, const FrameInfo_t *frame)
+{
+	if (drm_supports_amd_color_mgmt(drm) || !frame->applyOutputColorMgmt ||
+		drm->color_last_roots.size() != size_t(frame->layers.count())) return;
+	std::vector<uint64_t> signature{g_ColorMgmt.serial, drm->pCRTC->GetObjectId()};
+	signature.insert(signature.end(), drm->color_last_roots.begin(), drm->color_last_roots.end());
+	if (signature == drm->color_reported_program) return;
+	drm->color_reported_program = std::move(signature);
+	const bool planes = std::any_of(drm->color_last_roots.begin(), drm->color_last_roots.end(), [](uint64_t root) { return root != 0; });
+	const auto &gamma = drm->pCRTC->GetProperties().GAMMA_LUT;
+	drm_log.infof("Generic color scanout active: %d layer(s), plane pipeline=%s, CRTC gamma=%s",
+		frame->layers.count(), planes ? "on" : "off", gamma && gamma->GetCurrentValue() ? "on" : "off");
 }
 
 static int
@@ -5331,6 +5354,7 @@ namespace gamescope
 
 				if (drm->flags & DRM_MODE_ATOMIC_ALLOW_MODESET)
 					drm_update_screen_disabled( drm );
+				drm_report_generic_color_scanout(drm, pFrameInfo);
 			}
 
 			// Update the draw time

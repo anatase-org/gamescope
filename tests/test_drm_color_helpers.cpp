@@ -76,6 +76,64 @@ glm::vec3 EvaluateStages(std::span<const Stage> stages, glm::vec3 input)
     }
     return input;
 }
+template<typename Entry>
+glm::vec3 SampleWireCurve(const std::vector<uint8_t> &blob, glm::vec3 input, bool shared)
+{
+    const size_t size = blob.size() / sizeof(Entry);
+    CHECK(size >= 2);
+    glm::vec3 result;
+    for (int c = 0; c < 3; c++)
+    {
+        const float position = clamp01(input[c]) * float(size - 1);
+        const size_t lo = std::min(size_t(position), size - 2);
+        const Entry a = Read<Entry>(blob, lo), b = Read<Entry>(blob, lo + 1);
+        const double channelsA[] = {double(a.red), double(a.green), double(a.blue)};
+        const double channelsB[] = {double(b.red), double(b.green), double(b.blue)};
+        const int channel = shared ? 1 : c;
+        const double scale = sizeof(Entry) == sizeof(Lut32) ? double(UINT32_MAX) : double(UINT16_MAX);
+        result[c] = std::lerp(channelsA[channel], channelsB[channel], position - lo) / scale;
+    }
+    return result;
+}
+glm::vec3 EvaluateIntelPlane(const Pipeline &pipeline, const Program &program, glm::vec3 input,
+    bool quantizeMatrix = false)
+{
+    for (const auto &op : pipeline.operations)
+    {
+        const auto bypass = op.properties.at("BYPASS").id;
+        auto state = std::find_if(program.begin(), program.end(), [&](const auto &w) { return w.object == op.id && w.property == bypass; });
+        CHECK(state != program.end());
+        if (state->value) continue;
+        auto data = std::find_if(program.begin(), program.end(), [&](const auto &w) { return w.object == op.id && !w.blob.empty(); });
+        CHECK(data != program.end());
+        if (op.type == "1D LUT")
+            input = SampleWireCurve<Lut32>(data->blob, input, true); // kernel programs .green only
+        else
+        {
+            CHECK(op.type == "3x4 Matrix");
+            Matrix matrix;
+            for (int i = 0; i < 12; i++)
+            {
+                const uint64_t value = Read<uint64_t>(data->blob, i);
+                matrix[i] = double(value & ~(1ULL << 63)) / 4294967296.0 * (value >> 63 ? -1 : 1);
+                if (quantizeMatrix && i % 4 != 3)
+                {
+                    // patchworkan's xelpd_load_plane_csc_matrix uses the
+                    // ILK_CSC_COEFF_FP sliding precision window (9 bits).
+                    const uint64_t magnitude = value & ~(1ULL << 63);
+                    const double absolute = std::abs(matrix[i]);
+                    const int bits = absolute < .125 ? 12 : absolute < .25 ? 11 : absolute < .5 ? 10 :
+                        absolute < 1 ? 9 : absolute < 2 ? 8 : 7;
+                    const uint64_t rounded = std::min((magnitude >> (32 - bits - 3)) + 4, uint64_t(0xfff)) & 0xff8;
+                    matrix[i] = double(rounded >> 3) / (1u << bits) * (value >> 63 ? -1 : 1);
+                }
+            }
+            Stage affine = Affine(matrix);
+            input = EvaluateStages(std::span(&affine, 1), input);
+        }
+    }
+    return input;
+}
 void TestWireFormats()
 {
     CHECK(*SignMagnitude(1.5) == 0x180000000ULL);
@@ -332,6 +390,182 @@ void TestWhitePoint()
         Near(cube.data[coordinate.r + 17 * (coordinate.g + 17 * coordinate.b)], expected);
     }
 }
+
+void TestIntelSingleChannelNightMode()
+{
+    auto shaper = IdentityTable(4096);
+    auto cube = IdentityCube(17);
+    // Native SDR night mode is a separable tint. Intel's plane LUT loaders
+    // read only green; accepting this as a shared curve would dim all three
+    // channels by 0.5 and discard the intended temperature change.
+    for (size_t i = 0; i < cube.size(); i += 4)
+    {
+        cube[i + 1] = quantize_lut_value_16bit(cube[i + 1] / 65535.f * .5f);
+        cube[i + 2] = quantize_lut_value_16bit(cube[i + 2] / 65535.f * .25f);
+    }
+    Transform transform;
+    transform.managed = true;
+    transform.shaper = shaper;
+    transform.cube = cube;
+    auto variants = BuildVariants(transform);
+    CHECK(variants.size() >= 2);
+    Pipeline intel{42, 100, {Op(100, "1D LUT", 101), Op(101, "3x4 Matrix", 102), Op(102, "1D LUT", 0)}};
+    intel.operations[0].singleChannel = true;
+    intel.operations[0].properties["SIZE"].value = 128;
+    intel.operations[2].singleChannel = true;
+    intel.operations[2].properties["SIZE"].value = 32;
+    CHECK(!Compile(intel, variants[1]));
+    Pipeline postOnly{42, 102, {intel.operations[2]}};
+    CHECK(!Compile(postOnly, variants[1]));
+    auto matrixVariant = std::find_if(variants.begin(), variants.end(), [](const auto &stages) {
+        return stages.size() == 1 && stages[0].type == Stage::Type::Matrix;
+    });
+    CHECK(matrixVariant != variants.end());
+    auto hardwareNight = Compile(intel, *matrixVariant);
+    CHECK(hardwareNight);
+    bool sawMatrix = false;
+    for (const auto &write : *hardwareNight)
+    {
+        if (write.object != 101) CHECK(write.blob.empty());
+        if (!write.blob.empty())
+        {
+            sawMatrix = true;
+            CHECK(Read<uint64_t>(write.blob, 0) == *SignMagnitude(1));
+            CHECK(std::abs(double(Read<uint64_t>(write.blob, 5)) / 4294967296.0 - .5) < 2.0 / 65535);
+            CHECK(std::abs(double(Read<uint64_t>(write.blob, 10)) / 4294967296.0 - .25) < 2.0 / 65535);
+        }
+    }
+    CHECK(sawMatrix);
+    auto rgbPlane = intel;
+    rgbPlane.operations[0].singleChannel = false;
+    CHECK(Compile(rgbPlane, variants[1]));
+
+    // Shared transfer functions remain eligible for plane offload.
+    std::vector<Stage> uniform{Transfer(Curve::Gamma22Decode)};
+    CHECK(Compile(intel, uniform));
+
+    // The CRTC LUT has independent RGB entries and preserves the warm tint.
+    auto crtc = CompileCRTC(variants[1], 0, false, 1024);
+    CHECK(crtc && crtc->degamma.empty() && crtc->ctm.empty());
+    auto white = Read<Lut16>(crtc->gamma, 1023);
+    CHECK(white.red == UINT16_MAX);
+    CHECK(std::abs(int(white.green) - 32768) <= 1);
+    CHECK(std::abs(int(white.blue) - 16384) <= 1);
+
+    // On hardware with a 3D LUT, retain the full RGB transform there; only
+    // the uniform shaper is placed in the single-channel plane LUT.
+    intel.operations[1].properties["NEXT"].value = 103;
+    intel.operations.insert(intel.operations.begin() + 2, Op(103, "3D LUT", 102));
+    CHECK(Compile(intel, variants[0]));
+}
+
+void TestIntelNativeSDRNightScanout()
+{
+    // Exact topology and sizes from patchworkan/intel_color_pipeline.c.
+    Pipeline intel{42, 100, {Op(100, "1D LUT", 101), Op(101, "3x4 Matrix", 102), Op(102, "1D LUT", 0)}};
+    intel.operations[0].singleChannel = intel.operations[2].singleChannel = true;
+    intel.operations[0].properties["SIZE"].value = 128;
+    intel.operations[2].properties["SIZE"].value = 32;
+    for (float amount : {.001f, .01f, .1f, .5f, .8f, 1.f})
+    {
+        lut1d_t shape;
+        lut3d_t cube;
+        tonemapping_t tone;
+        calcColorTransform<17>(&shape, 4096, &cube, displaycolorimetry_709, EOTF_Gamma22,
+            displaycolorimetry_709, EOTF_Gamma22, displaycolorimetry_709, glm::vec2(0),
+            k_EChromaticAdapatationMethod_Bradford, {0, 1, 0, 0}, {amount, .05f, 1.f}, tone, nullptr, 1);
+        std::vector<uint16_t> shaper(shape.dataR.size() * 4), table(cube.data.size() * 4);
+        for (size_t i = 0; i < shape.dataR.size(); i++)
+        {
+            shaper[4 * i] = quantize_lut_value_16bit(shape.dataR[i]);
+            shaper[4 * i + 1] = quantize_lut_value_16bit(shape.dataG[i]);
+            shaper[4 * i + 2] = quantize_lut_value_16bit(shape.dataB[i]);
+        }
+        for (size_t i = 0; i < cube.data.size(); i++)
+            for (int c = 0; c < 3; c++) table[4 * i + c] = quantize_lut_value_16bit(cube.data[i][c]);
+        Transform transform;
+        transform.managed = true;
+        transform.shaper = shaper;
+        transform.cube = table;
+        auto variants = BuildVariants(transform);
+        auto matrix = std::find_if(variants.begin(), variants.end(), [](const auto &s) {
+            return s.size() == 1 && s[0].type == Stage::Type::Matrix;
+        });
+        CHECK(matrix != variants.end());
+        auto program = Compile(intel, *matrix);
+        CHECK(program); // hardware plane matrix; no CRTC or 3D LUT required
+        for (int i = 0; i < 256; i++)
+        {
+            const glm::vec3 input(float(i) / 255.f, float(255 - i) / 255.f, float((i * 23) % 256) / 255.f);
+            const auto expected = Sample3D(table, 17, Sample1D(shaper, input));
+            Near(EvaluateIntelPlane(intel, *program, input), expected, 2.1f / 65535);
+            Near(EvaluateIntelPlane(intel, *program, input, true), expected, 2.f / 1023);
+        }
+        const auto white = EvaluateIntelPlane(intel, *program, glm::vec3(1));
+        CHECK(white.r > white.g && white.g > white.b);
+
+        // Alpha-capable buffers/overlays retain linear-light blending. The
+        // tint goes in the matrix; only the shared sRGB decode uses the 32 LUT.
+        transform.blend = true;
+        auto blended = BuildVariants(transform);
+        auto blendMatrix = std::find_if(blended.begin(), blended.end(), [](const auto &s) {
+            return s.size() == 2 && s[0].type == Stage::Type::Matrix && s[1].type == Stage::Type::Curve;
+        });
+        CHECK(blendMatrix != blended.end());
+        auto blendProgram = Compile(intel, *blendMatrix);
+        CHECK(blendProgram);
+        const Stage outputStage = Transfer(Curve::SRGBEncode);
+        auto output = CompileCRTC(std::span(&outputStage, 1), 0, false, 1024);
+        CHECK(output && output->ctm.empty() && output->degamma.empty());
+        for (float alpha : {0.f, .3f, 1.f})
+        {
+            const glm::vec3 base(.8f, .6f, .4f), overlay(.2f, .4f, .7f);
+            const auto actual = SampleWireCurve<Lut16>(output->gamma,
+                glm::mix(EvaluateIntelPlane(intel, *blendProgram, base), EvaluateIntelPlane(intel, *blendProgram, overlay), alpha), false);
+            const auto expected = Evaluate(Curve::SRGBEncode, glm::mix(
+                Evaluate(Curve::SRGBDecode, Sample3D(table, 17, Sample1D(shaper, base))),
+                Evaluate(Curve::SRGBDecode, Sample3D(table, 17, Sample1D(shaper, overlay))), alpha));
+            Near(actual, expected, 2.f / 1023);
+        }
+    }
+}
+
+void TestAffineNightVariantLimits()
+{
+    auto cube = IdentityCube(17);
+    for (size_t i = 0; i < cube.size(); i += 4)
+    {
+        const float g = cube[i + 1] / 65535.f;
+        cube[i + 1] = quantize_lut_value_16bit(.5f * g * g);
+        cube[i + 2] /= 4;
+    }
+    // With only two shaper knots, checking shaper samples alone would miss
+    // all of this nonlinear cube axis. The crossing checks must reject it.
+    auto shaper = IdentityTable(2);
+    Transform t;
+    t.managed = true;
+    t.shaper = shaper;
+    t.cube = cube;
+    const auto hasMatrix = [](const auto &variants) {
+        return std::any_of(variants.begin(), variants.end(), [](const auto &s) {
+            return s.size() == 1 && s[0].type == Stage::Type::Matrix;
+        });
+    };
+    CHECK(!hasMatrix(BuildVariants(t)));
+
+    cube = IdentityCube(17);
+    for (size_t i = 0; i < cube.size(); i += 4) cube[i + 2] /= 4;
+    t.cube = cube;
+    CHECK(hasMatrix(BuildVariants(t)));
+    shaper = {0, 0, 0, 0, 65535, 65535, 65535, 0, 65535, 65535, 65535, 0};
+    t.shaper = shaper;
+    CHECK(!hasMatrix(BuildVariants(t))); // pre-matrix clipping cannot be dropped
+    shaper = IdentityTable(2);
+    t.shaper = shaper;
+    t.ctm = Identity();
+    (*t.ctm)[3] = .25;
+    CHECK(!hasMatrix(BuildVariants(t))); // retain clamping after a layer CTM
+}
 }
 
 int main()
@@ -342,4 +576,7 @@ int main()
     TestCRTCAndTransforms();
     TestAnalyticReference();
     TestWhitePoint();
+    TestIntelSingleChannelNightMode();
+    TestIntelNativeSDRNightScanout();
+    TestAffineNightVariantLimits();
 }

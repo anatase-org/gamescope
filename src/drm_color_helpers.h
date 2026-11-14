@@ -26,6 +26,9 @@ struct Operation
     uint32_t id = 0;
     std::string type;
     Properties properties;
+    // Some drivers expose a shared hardware curve through an RGB LUT blob.
+    // These operations must receive equal red, green, and blue entries.
+    bool singleChannel = false;
 };
 struct Pipeline
 {
@@ -69,7 +72,8 @@ glm::vec3 Sample3D(std::span<const uint16_t> table, uint32_t edge, glm::vec3 inp
 // libdrm versions predating drm_color_lut32 and drm_color_ctm_3x4.
 struct Lut32 { uint32_t red, green, blue, reserved; };
 struct Lut16 { uint16_t red, green, blue, reserved; };
-std::optional<std::vector<uint8_t>> SampleCurve(const Stage &stage, uint32_t size, bool wide);
+std::optional<std::vector<uint8_t>> SampleCurve(const Stage &stage, uint32_t size, bool wide,
+    bool singleChannel = false);
 
 enum class Encoding { SDR, PQ, ScRGB, Passthrough };
 struct Transform

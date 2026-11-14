@@ -182,7 +182,58 @@ std::optional<Stage> Separable(std::span<const uint16_t> cube, uint32_t edge)
     result.function = [cube, edge](glm::vec3 v) { return Sample3D(cube, edge, v); };
     return result;
 }
-std::optional<std::vector<uint8_t>> SampleCurve(const Stage &stage, uint32_t size, bool wide)
+
+namespace
+{
+// A native SDR night-mode LUT pair is just a diagonal matrix in encoded
+// space. Recognize it from the actual tables, including quantization, instead
+// of depending on the UI parameters or approximating a nonlinear look LUT.
+std::optional<Matrix> AffineLutPair(std::span<const uint16_t> shaper,
+    std::span<const uint16_t> cube, uint32_t edge)
+{
+    if (shaper.size() < 8 || shaper.size() % 4) return std::nullopt;
+    auto separable = Separable(cube, edge);
+    if (!separable) return std::nullopt;
+    auto curve = Compose(Table1D(shaper), *separable);
+    const glm::vec3 black = curve.function(glm::vec3(0));
+    const glm::vec3 white = curve.function(glm::vec3(1));
+    Matrix matrix{};
+    for (int c = 0; c < 3; c++)
+    {
+        matrix[4 * c + c] = double(white[c]) - black[c];
+        matrix[4 * c + 3] = black[c];
+    }
+    const auto matches = [&](double input)
+    {
+        const auto value = curve.function(glm::vec3(float(input)));
+        for (int c = 0; c < 3; c++)
+            if (std::abs(double(value[c]) - (matrix[4 * c + c] * input + matrix[4 * c + 3])) > 2.0 / 65535)
+                return false;
+        return true;
+    };
+    const size_t size = shaper.size() / 4;
+    // The composed curve is piecewise linear. Check every shaper knot and
+    // every crossing of a cube-axis knot, including nonmonotonic shapers.
+    // Between those points, the error from the fitted line is also linear.
+    for (size_t i = 0; i < size; i++)
+    {
+        if (!matches(double(i) / (size - 1))) return std::nullopt;
+        if (i + 1 == size) break;
+        for (int c = 0; c < 3; c++)
+        {
+            const double start = double(shaper[4 * i + c]) * (edge - 1) / 65535;
+            const double end = double(shaper[4 * (i + 1) + c]) * (edge - 1) / 65535;
+            if (start == end) continue;
+            for (int knot = int(std::floor(std::min(start, end))) + 1; knot < std::max(start, end); knot++)
+                if (!matches((double(i) + (knot - start) / (end - start)) / (size - 1)))
+                    return std::nullopt;
+        }
+    }
+    return matrix;
+}
+}
+
+std::optional<std::vector<uint8_t>> SampleCurve(const Stage &stage, uint32_t size, bool wide, bool singleChannel)
 {
     if (stage.type != Stage::Type::Curve || !stage.bounded || !stage.function || size < 2 || size > 65536)
         return std::nullopt;
@@ -199,6 +250,8 @@ std::optional<std::vector<uint8_t>> SampleCurve(const Stage &stage, uint32_t siz
             if (!Finite(value[c]) || value[c] < -0.000001f || value[c] > 1.000001f) return std::nullopt;
             channels[c] = uint32_t(std::round(double(clamp01(value[c])) * (wide ? 4294967295.0 : 65535.0)));
         }
+        if (singleChannel && (channels[0] != channels[1] || channels[1] != channels[2]))
+            return std::nullopt;
         if (wide) lut32.push_back({channels[0], channels[1], channels[2], 0});
         else lut16.push_back({uint16_t(channels[0]), uint16_t(channels[1]), uint16_t(channels[2]), 0});
         samples.push_back(glm::vec3(channels[0], channels[1], channels[2]) / (wide ? 4294967295.f : 65535.f));
@@ -284,6 +337,16 @@ std::vector<std::vector<Stage>> BuildVariants(const Transform &t)
         auto simple = prefix;
         simple.push_back(Compose(Table1D(t.shaper), *separable));
         finish(std::move(simple));
+        // Intel plane LUTs share one curve between RGB, but its CSC can
+        // apply the independent encoded gains used by native SDR night mode.
+        // Retain the blend decode/output encoding when blending is required.
+        // A nonlinear prefix could leave the LUT's clamped input domain, so
+        // do not move an affine replacement across a layer CTM or scRGB TF.
+        if (prefix.empty())
+            if (auto matrix = AffineLutPair(t.shaper, t.cube, t.edge))
+                if ((*matrix)[0] != (*matrix)[5] || (*matrix)[5] != (*matrix)[10] ||
+                    (*matrix)[3] != (*matrix)[7] || (*matrix)[7] != (*matrix)[11])
+                    finish({Affine(*matrix)});
     }
     // Arbitrary look LUTs and nonlinear gamut/tone mappings never reach this
     // branch: the generator supplies an analytic description only when exact.
@@ -345,7 +408,7 @@ std::optional<Program> Compile(const Pipeline &pipeline, std::span<const Stage> 
             if (!interpolation || !interpolation->enums.contains("Linear")) return std::nullopt;
             if (interpolation->immutable && interpolation->value != interpolation->enums.at("Linear")) return std::nullopt;
             if (size->value > 65536) return std::nullopt;
-            blob = SampleCurve(stage, uint32_t(size->value), true);
+            blob = SampleCurve(stage, uint32_t(size->value), true, op.singleChannel);
         }
         if (stage.type == Stage::Type::Lut3D && op.type == "3D LUT" && size)
         {
