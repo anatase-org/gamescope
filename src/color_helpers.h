@@ -376,6 +376,8 @@ struct color_matrix_transform_t
 	EOTF sourceEOTF = EOTF_Gamma22;
 	EOTF destEOTF = EOTF_Gamma22;
 	float sdrLuminance = 1.f;
+	// The finite sRGB toe preserves shadows with a shared CRTC output LUT.
+	bool sdrUseSRGB = false;
 };
 
 template <uint32_t lutEdgeSize3d>
@@ -387,7 +389,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
 	const glm::vec2 & destVirtualWhite, EChromaticAdaptationMethod eMethod,
 	const colormapping_t & mapping, const nightmode_t & nightmode, const tonemapping_t & tonemapping,
 	const lut3d_t * pLook, float flGain,
-	std::optional<color_matrix_transform_t> *pMatrixTransform = nullptr );
+	std::optional<color_matrix_transform_t> *pMatrixTransform = nullptr, bool sdrUseSRGB = false );
 
 #define REGISTER_LUT_EDGE_SIZE(size) template void calcColorTransform<(size)>( lut1d_t * pShaper, int nLutSize1d, \
 	lut3d_t * pLut3d,                                                                                                   \
@@ -396,13 +398,18 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
 	const displaycolorimetry_t & native,                                                                               \
 	const glm::vec2 & destVirtualWhite, EChromaticAdaptationMethod eMethod,                                             \
 	const colormapping_t & mapping, const nightmode_t & nightmode, const tonemapping_t & tonemapping,                   \
-	const lut3d_t * pLook, float flGain, std::optional<color_matrix_transform_t> *pMatrixTransform )
+	const lut3d_t * pLook, float flGain, std::optional<color_matrix_transform_t> *pMatrixTransform, bool sdrUseSRGB )
 
 // Build colorimetry and a gamut mapping for the given SDR configuration
 // Note: the output colorimetry will use the native display's white point
 // Only the color gamut will change
 void buildSDRColorimetry( displaycolorimetry_t * pColorimetry, colormapping_t *pMapping,
 	float flSDRGamutWideness, const displaycolorimetry_t & nativeDisplayOutput );
+
+// Matrix-only SDR controls: 0.5 is native, 0 is Rec.709, and 1 widens to
+// Rec.2020 (wide panels) or the generic wide gamut (narrow panels).
+void buildSDRColorimetryMatrix( displaycolorimetry_t *pColorimetry, colormapping_t *pMapping,
+	float flSDRGamutWideness, const displaycolorimetry_t &nativeDisplayOutput );
 
 // Build colorimetry and a gamut mapping for the given PQ configuration
 void buildPQColorimetry( displaycolorimetry_t * pColorimetry, colormapping_t *pMapping, const displaycolorimetry_t & nativeDisplayOutput );

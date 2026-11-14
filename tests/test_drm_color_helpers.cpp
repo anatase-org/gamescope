@@ -566,6 +566,87 @@ void TestAffineNightVariantLimits()
     (*t.ctm)[3] = .25;
     CHECK(!hasMatrix(BuildVariants(t))); // retain clamping after a layer CTM
 }
+
+void TestIntelVibranceAndTemperature()
+{
+    // Claw's xe plane topology. Its post-CSC LUT cannot accurately encode
+    // gamma; use linear-light planes and the shared 1024-entry CRTC curve.
+    Pipeline intel{42, 100, {Op(100, "1D LUT", 101), Op(101, "3x4 Matrix", 102), Op(102, "1D LUT", 0)}};
+    intel.operations[0].singleChannel = intel.operations[2].singleChannel = true;
+    intel.operations[0].properties["SIZE"].value = 128;
+    intel.operations[2].properties["SIZE"].value = 32;
+    const Stage encode = Transfer(Curve::SRGBEncode);
+    const auto crtc = CompileCRTC(std::span(&encode, 1), 0, false, 1024);
+    CHECK(crtc);
+    const displaycolorimetry_t claw{
+        {{.646484375f, .331054688f}, {.296875f, .619140625f}, {.141601562f, .05078125f}},
+        {.3046875f, .325195312f}};
+
+    for (const auto &native : {claw, displaycolorimetry_2020})
+    for (float vibrance : {-1.f, 0.f, .25f, .5f, .5625f, .75f, 1.f})
+    for (auto white : {glm::vec2(0), glm::vec2(.305357456f, .321646303f), glm::vec2(.3457f, .3585f)})
+    for (float night : {0.f, .615572214f})
+    {
+        displaycolorimetry_t source;
+        colormapping_t mapping;
+        buildSDRColorimetryMatrix(&source, &mapping, vibrance, native);
+        CHECK(mapping.blendAmountMin == 0 && mapping.blendAmountMax == 0);
+        CHECK(source.white == native.white);
+        if (vibrance < 0 || vibrance == .5f) CHECK(source == native);
+        lut1d_t shaper;
+        lut3d_t cube;
+        tonemapping_t tone;
+        std::optional<color_matrix_transform_t> analytic;
+        calcColorTransform<17>(&shaper, 4096, &cube, source, EOTF_Gamma22,
+            native, EOTF_Gamma22, native, white, k_EChromaticAdapatationMethod_Bradford,
+            mapping, {night, .069444448f, .95f}, tone, nullptr, 1, &analytic, true);
+        CHECK(analytic && analytic->sdrUseSRGB);
+        std::vector<uint16_t> shape(shaper.dataR.size() * 4), table(cube.data.size() * 4);
+        for (size_t i = 0; i < shaper.dataR.size(); i++)
+            for (int c = 0; c < 3; c++) shape[4 * i + c] = quantize_lut_value_16bit(shaper.dataR[i]);
+        for (size_t i = 0; i < cube.data.size(); i++)
+            for (int c = 0; c < 3; c++) table[4 * i + c] = quantize_lut_value_16bit(cube.data[i][c]);
+        Transform transform;
+        transform.managed = transform.blend = true;
+        transform.shaper = shape;
+        transform.cube = table;
+        transform.analytic = analytic;
+        const auto variants = BuildVariants(transform);
+        const auto program = Compile(intel, variants.back());
+        CHECK(program);
+        for (int i = 0; i < 256; i++)
+        {
+            // A gray ramp exercises the near-black toe as well as colored
+            // samples; a 32-entry gamma encode would visibly crush this ramp.
+            const glm::vec3 gray(float(i) / 255.f);
+            const auto grayExpected = Evaluate(Curve::SRGBEncode,
+                glm::clamp(analytic->matrix * Evaluate(Curve::SRGBDecode, gray), glm::vec3(0), glm::vec3(1)));
+            Near(SampleWireCurve<Lut16>(crtc->gamma, EvaluateIntelPlane(intel, *program, gray), false), grayExpected, 2.f / 1023);
+            const glm::vec3 input(float(i) / 255.f, float(255 - i) / 255.f, float((i * 23) % 256) / 255.f);
+            const auto linear = glm::clamp(analytic->matrix * Evaluate(Curve::SRGBDecode, input), glm::vec3(0), glm::vec3(1));
+            const auto expected = Evaluate(Curve::SRGBEncode, linear);
+            const auto actual = SampleWireCurve<Lut16>(crtc->gamma, EvaluateIntelPlane(intel, *program, input), false);
+            Near(actual, expected, 2.f / 1023);
+            // Include the actual sliding precision of Intel's CSC coefficients.
+            const auto quantized = SampleWireCurve<Lut16>(crtc->gamma, EvaluateIntelPlane(intel, *program, input, true), false);
+            Near(quantized, expected, 5.f / 1023);
+        }
+        // GPU LUT generation uses the same transfer functions and matrix.
+        for (auto point : {glm::ivec3(0), glm::ivec3(1), glm::ivec3(4, 8, 12), glm::ivec3(16)})
+        {
+            const auto input = glm::vec3(point) / 16.f;
+            const auto linear = glm::clamp(analytic->matrix * Evaluate(Curve::SRGBDecode, input), glm::vec3(0), glm::vec3(1));
+            Near(cube.data[point.r + 17 * (point.g + 17 * point.b)], Evaluate(Curve::SRGBEncode, linear));
+        }
+        // Alpha overlays blend after both transforms, before the shared encode.
+        const glm::vec3 base(.8f, .6f, .4f), overlay(.2f, .4f, .7f);
+        const auto expected = Evaluate(Curve::SRGBEncode, glm::mix(
+            glm::clamp(analytic->matrix * Evaluate(Curve::SRGBDecode, base), glm::vec3(0), glm::vec3(1)),
+            glm::clamp(analytic->matrix * Evaluate(Curve::SRGBDecode, overlay), glm::vec3(0), glm::vec3(1)), .3f));
+        Near(SampleWireCurve<Lut16>(crtc->gamma, glm::mix(EvaluateIntelPlane(intel, *program, base),
+            EvaluateIntelPlane(intel, *program, overlay), .3f), false), expected, 2.f / 1023);
+    }
+}
 }
 
 int main()
@@ -579,4 +660,5 @@ int main()
     TestIntelSingleChannelNightMode();
     TestIntelNativeSDRNightScanout();
     TestAffineNightVariantLimits();
+    TestIntelVibranceAndTemperature();
 }

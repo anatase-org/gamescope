@@ -357,13 +357,15 @@ std::vector<std::vector<Stage>> BuildVariants(const Transform &t)
         // 10,000 nits, and a layer CTM precedes the LUT's source EOTF decode.
         // Combining its matrix across those nonlinear stages would be wrong.
         std::vector<Stage> analytic = prefix;
-        analytic.push_back(Transfer(a.sourceEOTF == EOTF_PQ ? Curve::PQNormalizedDecode : Curve::Gamma22Decode));
+        analytic.push_back(Transfer(a.sourceEOTF == EOTF_PQ ? Curve::PQNormalizedDecode :
+            a.sdrUseSRGB ? Curve::SRGBDecode : Curve::Gamma22Decode));
         const double sourceNits = a.sourceEOTF == EOTF_PQ ? 10000.0 : a.sdrLuminance;
         const double destNits = a.destEOTF == EOTF_PQ ? 10000.0 : a.sdrLuminance;
         Matrix matrix = FromMatrix(a.matrix);
         for (double &value : matrix) value *= sourceNits / destNits;
         if (matrix != Identity()) analytic.push_back(Affine(matrix));
-        analytic.push_back(Transfer(a.destEOTF == EOTF_PQ ? Curve::PQNormalizedEncode : Curve::Gamma22Encode));
+        analytic.push_back(Transfer(a.destEOTF == EOTF_PQ ? Curve::PQNormalizedEncode :
+            a.sdrUseSRGB ? Curve::SRGBEncode : Curve::Gamma22Encode));
         finish(std::move(analytic));
     }
     return variants;

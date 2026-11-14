@@ -367,6 +367,10 @@ namespace gamescope
 
         virtual bool SupportsExplicitSync() const = 0;
 
+        // Prefer SDR adjustments expressible with transfer curves and a matrix
+        // when the display engine has no per-plane 3D LUT.
+        virtual bool PrefersMatrixColorManagement() const { return false; }
+
         virtual bool SupportsScreenSleep() const
         {
             return false;

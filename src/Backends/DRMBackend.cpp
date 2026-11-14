@@ -3201,8 +3201,18 @@ static int drm_prepare_generic_color(struct drm_t *drm, const FrameInfo_t *frame
 		drm->color_failed_frames.clear();
 		drm->color_cache_serial = g_ColorMgmt.serial;
 	}
+	// Matrix SDR adjustments use sRGB linear light through the blend unit.
+	// Keep the shared output curve even for a single opaque layer: Intel's
+	// 32-entry post-CSC LUT cannot encode shadows with sufficient precision.
+	bool matrixSdr = false;
+	for (int i = 0; i < frame->layers.count(); i++)
+	{
+		const auto &layer = frame->layers[i];
+		const auto &analytic = g_ColorMgmtLuts[ColorSpaceToEOTFIndex(layer.colorspace)].matrixTransform;
+		matrixSdr |= layer.applyColorMgmt && !layer.outputColorMgmtApplied && analytic && analytic->sdrUseSRGB;
+	}
 	const bool blend = frame->applyOutputColorMgmt && !frame->blendInDisplayEncoding &&
-		!drm_single_opaque_color_layer(frame);
+		(matrixSdr || !drm_single_opaque_color_layer(frame));
 	const int count = frame->layers.count();
 	const auto geometry = FrameInfoToLiftoffStateCacheEntry(drm, frame);
 	std::vector<uint64_t> frameKey{uint64_t(count), uint64_t(drm->flags)};
@@ -5133,6 +5143,21 @@ namespace gamescope
 		virtual bool SupportsPlaneHardwareCursor() const override
 		{
 			return !g_DRM.is_vc4;
+		}
+
+		bool PrefersMatrixColorManagement() const override
+		{
+			if (!g_DRM.is_intel || !g_DRM.generic_plane_color || g_DRM.color_pipelines.empty())
+				return false;
+			bool hasMatrix = false;
+			for (const auto &[plane, pipelines] : g_DRM.color_pipelines)
+				for (const auto &pipeline : pipelines)
+					for (const auto &op : pipeline.operations)
+					{
+						if (op.type == "3D LUT") return false;
+						hasMatrix |= op.type == "3x4 Matrix";
+					}
+			return hasMatrix;
 		}
 
 		virtual bool SupportsTearing() const override

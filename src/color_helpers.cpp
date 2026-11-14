@@ -631,10 +631,12 @@ bool BOutOfGamut( const glm::vec3 & color )
 }
 
 template <typename T>
-inline T calcEOTFToLinear( const T & input, EOTF eotf, const tonemapping_t & tonemapping )
+inline T calcEOTFToLinear( const T & input, EOTF eotf, const tonemapping_t & tonemapping, bool sdrUseSRGB = false )
 {
     if ( eotf == EOTF_Gamma22 )
     {
+        if (sdrUseSRGB)
+            return T(srgb_to_linear(input.r), srgb_to_linear(input.g), srgb_to_linear(input.b)) * tonemapping.g22_luminance;
         return glm::pow( input, T( 2.2f ) ) * tonemapping.g22_luminance;
     }
     else if ( eotf == EOTF_PQ )
@@ -646,7 +648,7 @@ inline T calcEOTFToLinear( const T & input, EOTF eotf, const tonemapping_t & ton
 }
 
 template <typename T>
-inline T calcLinearToEOTF( const T & input, EOTF eotf, const tonemapping_t & tonemapping )
+inline T calcLinearToEOTF( const T & input, EOTF eotf, const tonemapping_t & tonemapping, bool sdrUseSRGB = false )
 {
     if ( eotf == EOTF_Gamma22 )
     {
@@ -655,6 +657,8 @@ inline T calcLinearToEOTF( const T & input, EOTF eotf, const tonemapping_t & ton
         {
             val = glm::clamp( input / tonemapping.g22_luminance, T( 0.f ), T( 1.f ) );
         }
+        if (sdrUseSRGB)
+            return T(linear_to_srgb(val.r), linear_to_srgb(val.g), linear_to_srgb(val.b));
         return glm::pow( val, T( 1.f/2.2f ) );
     }
     else if ( eotf == EOTF_PQ )
@@ -671,17 +675,17 @@ inline T calcLinearToEOTF( const T & input, EOTF eotf, const tonemapping_t & ton
 bool g_bUseSourceEOTFForShaper = false;
 
 template <typename T>
-inline T applyShaper( const T & input, EOTF source, EOTF dest, const tonemapping_t & tonemapping, float flGain )
+inline T applyShaper( const T & input, EOTF source, EOTF dest, const tonemapping_t & tonemapping, float flGain, bool sdrUseSRGB )
 {
     if ( ( source == dest && flGain == 1.f ) || !tonemapping.bUseShaper )
     {
         return input;
     }
 
-    T flLinear = flGain * calcEOTFToLinear( input, source, tonemapping );
+    T flLinear = flGain * calcEOTFToLinear( input, source, tonemapping, sdrUseSRGB );
     flLinear = tonemapping.apply( flLinear );
 
-    return calcLinearToEOTF( flLinear, g_bUseSourceEOTFForShaper ? source : dest, tonemapping );
+    return calcLinearToEOTF( flLinear, g_bUseSourceEOTFForShaper ? source : dest, tonemapping, sdrUseSRGB );
 }
 
 bool g_bHuePreservationWhenClipping = false;
@@ -694,7 +698,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
     const displaycolorimetry_t & native,
     const glm::vec2 & destVirtualWhite, EChromaticAdaptationMethod eMethod,
     const colormapping_t & mapping, const nightmode_t & nightmode, const tonemapping_t & tonemapping,
-    const lut3d_t * pLook, float flGain, std::optional<color_matrix_transform_t> *pMatrixTransform )
+    const lut3d_t * pLook, float flGain, std::optional<color_matrix_transform_t> *pMatrixTransform, bool sdrUseSRGB )
 {
     if (pMatrixTransform)
         pMatrixTransform->reset();
@@ -713,7 +717,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
         for ( int nVal=0; nVal<nLutSize1d; ++nVal )
         {
             glm::vec3 sourceColorEOTFEncoded = { nVal * flScale, nVal * flScale, nVal * flScale };
-            glm::vec3 shapedSourceColor = applyShaper( sourceColorEOTFEncoded, sourceEOTF, destEOTF, tonemapping, flGain );
+            glm::vec3 shapedSourceColor = applyShaper( sourceColorEOTFEncoded, sourceEOTF, destEOTF, tonemapping, flGain, sdrUseSRGB );
             pShaper->dataR[nVal] = shapedSourceColor.r;
             pShaper->dataG[nVal] = shapedSourceColor.g;
             pShaper->dataB[nVal] = shapedSourceColor.b;
@@ -741,7 +745,10 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
         // amount and saturation are overdetermined but we separate the two as they conceptually represent
         // different quantities, and this preserves forwards algorithmic compatibility
         glm::vec3 nightModeMultHSV( nightmode.hue, clamp01( nightmode.saturation * nightmode.amount ), 1.f );
-        glm::vec3 vMultLinear = glm::pow( hsv_to_rgb( nightModeMultHSV ), glm::vec3( 2.2f ) );
+        const glm::vec3 nightRGB = hsv_to_rgb( nightModeMultHSV );
+        glm::vec3 vMultLinear = sdrUseSRGB ?
+            glm::vec3(srgb_to_linear(nightRGB.r), srgb_to_linear(nightRGB.g), srgb_to_linear(nightRGB.b)) :
+            glm::pow( nightRGB, glm::vec3( 2.2f ) );
         vMultLinear = vMultLinear * flGain;
 
         // Calculate the virtual white point adaptation
@@ -784,7 +791,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
                 dest_from_native * mapping.blendAmountMin;
             *pMatrixTransform = color_matrix_transform_t{
                 whitePointDestAdaptation * glm::diagonal3x3(vMultLinear) * gamut,
-                sourceEOTF, destEOTF, tonemapping.g22_luminance };
+                sourceEOTF, destEOTF, tonemapping.g22_luminance, sdrUseSRGB };
         }
         // Preserve the evaluation order for luma tone mapping, which can amplify
         // rounding differences when the PQ decode is moved before the matrix.
@@ -799,7 +806,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
                 vSourceColorEdge[nIndex] = ApplyLut1D_Inverse_Linear( *pShaper, vSourceColorEdge[nIndex] );
             }
             if ( cacheDecodedEdge )
-                vSourceColorEdge[nIndex] = calcEOTFToLinear( vSourceColorEdge[nIndex], sourceEOTF, tonemapping );
+                vSourceColorEdge[nIndex] = calcEOTFToLinear( vSourceColorEdge[nIndex], sourceEOTF, tonemapping, sdrUseSRGB );
         }
 
         pLut3d->resize( nLutEdgeSize3d );
@@ -814,7 +821,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
                     if ( !cacheDecodedEdge )
                     {
                         const glm::vec3 encoded = hasLook ? ApplyLut3D_Tetrahedral( *pLook, sourceColorLinear ) : sourceColorLinear;
-                        sourceColorLinear = calcEOTFToLinear( encoded, sourceEOTF, tonemapping );
+                        sourceColorLinear = calcEOTFToLinear( encoded, sourceEOTF, tonemapping, sdrUseSRGB );
                     }
 
                     // Convert to dest colorimetry (linearized display referred)
@@ -852,7 +859,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
                     }
 
                     // Apply dest EOTF
-                    glm::vec3 destColorEOTFEncoded = calcLinearToEOTF( destColorLinear, destEOTF, tonemapping );
+                    glm::vec3 destColorEOTFEncoded = calcLinearToEOTF( destColorLinear, destEOTF, tonemapping, sdrUseSRGB );
 
                     // Write LUT
                     pLut3d->data[GetLut3DIndexRedFastRGB( nRed, nGreen, nBlue, nLutEdgeSize3d )] = destColorEOTFEncoded;
@@ -866,6 +873,24 @@ bool BIsWideGamut( const displaycolorimetry_t & nativeDisplayOutput )
 {
     // Use red as a sentinal for a wide-gamut display
     return ( nativeDisplayOutput.primaries.r.x > 0.650f && nativeDisplayOutput.primaries.r.y < 0.320f );
+}
+
+void buildSDRColorimetryMatrix( displaycolorimetry_t *pColorimetry, colormapping_t *pMapping,
+    float wideness, const displaycolorimetry_t &native )
+{
+    *pMapping = {0.f, 1.f, 0.f, 0.f};
+    if (wideness < 0.f) wideness = .5f;
+    wideness = clamp01(wideness);
+    if (wideness == .5f)
+    {
+        *pColorimetry = native;
+        return;
+    }
+    auto target = wideness <= .5f ? displaycolorimetry_709 :
+        BIsWideGamut(native) ? displaycolorimetry_2020 : displaycolorimetry_widegamutgeneric;
+    target.white = native.white;
+    *pColorimetry = lerp(native, target, std::abs(wideness * 2.f - 1.f));
+    pColorimetry->white = native.white;
 }
 
 void buildSDRColorimetry( displaycolorimetry_t * pColorimetry, colormapping_t *pMapping,
