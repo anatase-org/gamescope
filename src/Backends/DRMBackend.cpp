@@ -1541,10 +1541,11 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 	// Don't allow rollback of mode_id after connector change
 	drm->current.mode_id = drm->pending.mode_id;
 
+	// Match the logical output orientation before applying the minimum physical size.
 	const struct wlserver_output_info wlserver_output_info = {
 		.description = description,
-		.phys_width = (int) best->GetModeConnector()->mmWidth,
-		.phys_height = (int) best->GetModeConnector()->mmHeight,
+		.phys_width = (int) ( g_bRotated ? best->GetModeConnector()->mmHeight : best->GetModeConnector()->mmWidth ),
+		.phys_height = (int) ( g_bRotated ? best->GetModeConnector()->mmWidth : best->GetModeConnector()->mmHeight ),
 	};
 	wlserver_lock();
 	wlserver_set_output_info(&wlserver_output_info);
