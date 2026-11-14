@@ -64,3 +64,12 @@ test_color_helpers = executable(
 	cpp_args: gamescope_cpp_args,
 )
 test('color-helpers', test_color_helpers)
+
+test_drm_color_helpers = executable(
+  'test_drm_color_helpers',
+  ['test_drm_color_helpers.cpp', srcdir / 'drm_color_helpers.cpp', srcdir / 'color_helpers.cpp'],
+  include_directories: [srcdir],
+  dependencies: [glm_dep],
+  cpp_args: gamescope_cpp_args,
+)
+test('drm-color-helpers', test_drm_color_helpers)

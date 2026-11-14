@@ -7,6 +7,7 @@
 #include <cmath>
 #include <vector>
 #include <memory>
+#include <optional>
 
 #include <glm/vec2.hpp> // glm::vec2
 #include <glm/vec3.hpp> // glm::vec3
@@ -367,6 +368,16 @@ std::shared_ptr<lut3d_t> LoadCubeLut( const char *pchFileName, bool &bRaisesBlac
 // native defines the display colorimetry for the saturation blend target.
 // dest defines the output colorimetry used by both blend endpoints.
 
+// An exact analytic alternative to the generated LUT pair, when the transform
+// contains only transfer functions and a linear matrix. Luminances are in nits.
+struct color_matrix_transform_t
+{
+	glm::mat3 matrix{ 1.f };
+	EOTF sourceEOTF = EOTF_Gamma22;
+	EOTF destEOTF = EOTF_Gamma22;
+	float sdrLuminance = 1.f;
+};
+
 template <uint32_t lutEdgeSize3d>
 void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
 	lut3d_t * pLut3d,
@@ -375,7 +386,8 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
 	const displaycolorimetry_t & native,
 	const glm::vec2 & destVirtualWhite, EChromaticAdaptationMethod eMethod,
 	const colormapping_t & mapping, const nightmode_t & nightmode, const tonemapping_t & tonemapping,
-	const lut3d_t * pLook, float flGain );
+	const lut3d_t * pLook, float flGain,
+	std::optional<color_matrix_transform_t> *pMatrixTransform = nullptr );
 
 #define REGISTER_LUT_EDGE_SIZE(size) template void calcColorTransform<(size)>( lut1d_t * pShaper, int nLutSize1d, \
 	lut3d_t * pLut3d,                                                                                                   \
@@ -384,7 +396,7 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
 	const displaycolorimetry_t & native,                                                                               \
 	const glm::vec2 & destVirtualWhite, EChromaticAdaptationMethod eMethod,                                             \
 	const colormapping_t & mapping, const nightmode_t & nightmode, const tonemapping_t & tonemapping,                   \
-	const lut3d_t * pLook, float flGain )
+	const lut3d_t * pLook, float flGain, std::optional<color_matrix_transform_t> *pMatrixTransform )
 
 // Build colorimetry and a gamut mapping for the given SDR configuration
 // Note: the output colorimetry will use the native display's white point

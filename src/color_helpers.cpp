@@ -694,8 +694,10 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
     const displaycolorimetry_t & native,
     const glm::vec2 & destVirtualWhite, EChromaticAdaptationMethod eMethod,
     const colormapping_t & mapping, const nightmode_t & nightmode, const tonemapping_t & tonemapping,
-    const lut3d_t * pLook, float flGain )
+    const lut3d_t * pLook, float flGain, std::optional<color_matrix_transform_t> *pMatrixTransform )
 {
+    if (pMatrixTransform)
+        pMatrixTransform->reset();
     // Generate shaper lut
     // Note: while this is typically a 1D approximation of our end to end transform,
     // it need not be! Conceptually this is just to determine the interpolation properties...
@@ -767,6 +769,23 @@ void calcColorTransform( lut1d_t * pShaper, int nLutSize1d,
         // Without a look LUT, each source channel has only one value per edge.
         // Decode those values once, instead of repeating the EOTF for every cell.
         const bool hasLook = pLook && !pLook->data.empty();
+        bool shaperClips = false;
+        if (pShaper)
+            for (size_t i = 1; i < pShaper->dataR.size(); i++)
+                shaperClips |= pShaper->dataR[i] <= pShaper->dataR[i - 1] ||
+                    pShaper->dataG[i] <= pShaper->dataG[i - 1] || pShaper->dataB[i] <= pShaper->dataB[i - 1];
+        // Record only transforms which can be represented without a 3D LUT.
+        // A saturation-dependent blend is harmless when both endpoints agree.
+        if (pMatrixTransform && !hasLook && !shaperClips && !g_bHuePreservationWhenClipping &&
+            tonemapping.eOperator == ETonemapOperator_None &&
+            (mapping.blendAmountMin == mapping.blendAmountMax || dest_from_source == dest_from_native))
+        {
+            const glm::mat3 gamut = dest_from_source * (1.f - mapping.blendAmountMin) +
+                dest_from_native * mapping.blendAmountMin;
+            *pMatrixTransform = color_matrix_transform_t{
+                whitePointDestAdaptation * glm::diagonal3x3(vMultLinear) * gamut,
+                sourceEOTF, destEOTF, tonemapping.g22_luminance };
+        }
         // Preserve the evaluation order for luma tone mapping, which can amplify
         // rounding differences when the PQ decode is moved before the matrix.
         const bool cacheDecodedEdge = !hasLook && tonemapping.eOperator != ETonemapOperator_EETF2390_Luma;

@@ -672,6 +672,7 @@ using rendervulkan::s_nLutSize1d;
 
 struct gamescope_color_mgmt_luts
 {
+	std::optional<color_matrix_transform_t> matrixTransform;
 	bool bHasLut3D = false;
 	bool bHasLut1D = false;
 	uint16_t lut3d[s_nLutEdgeSize3d*s_nLutEdgeSize3d*s_nLutEdgeSize3d*4];
@@ -687,6 +688,7 @@ struct gamescope_color_mgmt_luts
 
 	void shutdown()
 	{
+		matrixTransform.reset();
 		bHasLut1D = false;
 		bHasLut3D = false;
 		vk_lut1d = nullptr;
@@ -695,6 +697,7 @@ struct gamescope_color_mgmt_luts
 
 	void reset()
 	{
+		matrixTransform.reset();
 		bHasLut1D = false;
 		bHasLut3D = false;
 	}

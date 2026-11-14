@@ -394,6 +394,7 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 
 		if ( g_ColorMgmtLutsOverride[nInputEOTF].HasLuts() )
 		{
+			outColorMgmtLuts[nInputEOTF].matrixTransform.reset();
 			memcpy(g_ColorMgmtLuts[nInputEOTF].lut1d, g_ColorMgmtLutsOverride[nInputEOTF].lut1d, sizeof(g_ColorMgmtLutsOverride[nInputEOTF].lut1d));
 			memcpy(g_ColorMgmtLuts[nInputEOTF].lut3d, g_ColorMgmtLutsOverride[nInputEOTF].lut3d, sizeof(g_ColorMgmtLutsOverride[nInputEOTF].lut3d));
 		}
@@ -492,7 +493,8 @@ create_color_mgmt_luts(const gamescope_color_mgmt_t& newColorMgmt, gamescope_col
 				outputEncodingColorimetry, newColorMgmt.outputEncodingEOTF,
 				displayColorimetry,
 				virtualWhite, newColorMgmt.chromaticAdaptationMode,
-				colorMapping, newColorMgmt.nightmode, tonemapping, pLook, flGain );
+				colorMapping, newColorMgmt.nightmode, tonemapping, pLook, flGain,
+				&outColorMgmtLuts[nInputEOTF].matrixTransform );
 
 			// Create quantized output luts
 			for ( size_t i=0, end = g_tmpLut1d.dataR.size(); i<end; ++i )

@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -34,6 +35,7 @@
 
 #include "backend.h"
 #include "color_helpers.h"
+#include "drm_color_helpers.h"
 #include "Utils/Defer.h"
 #include "drm_include.h"
 #include "edid.h"
@@ -108,6 +110,14 @@ namespace gamescope
 	class CDRMConnector;
 }
 
+struct DRMColorCandidate
+{
+	uint32_t plane = 0;
+	uint64_t root = 0;
+	drm_color::Program program;
+	std::vector<std::shared_ptr<gamescope::BackendBlob>> blobs;
+};
+
 struct drm_t {
 	bool bUseLiftoff;
 
@@ -120,6 +130,14 @@ struct drm_t {
 	struct wlr_drm_format_set formats;
 	bool is_nvidia = false;
 	bool is_vc4 = false;
+	bool generic_plane_color = false;
+	std::map<uint32_t, std::vector<drm_color::Pipeline>> color_pipelines;
+	std::map<std::vector<uint64_t>, std::vector<DRMColorCandidate>> color_program_cache;
+	std::map<std::vector<uint64_t>, std::optional<drm_color::CrtcProgram>> color_output_cache;
+	std::set<std::vector<uint64_t>> color_failed_frames;
+	std::vector<uint64_t> color_last_roots;
+	std::string color_failure;
+	uint32_t color_cache_serial = 0;
 #if HAVE_GBM
 	struct gbm_device *gbm = nullptr;
 #endif
@@ -149,6 +167,7 @@ struct drm_t {
 		std::shared_ptr<gamescope::BackendBlob> lut3d_id[ EOTF_Count ];
 		std::shared_ptr<gamescope::BackendBlob> shaperlut_id[ EOTF_Count ];
 		amdgpu_transfer_function output_tf = AMDGPU_TRANSFER_FUNCTION_DEFAULT;
+		std::vector<std::shared_ptr<gamescope::BackendBlob>> generic_color_blobs;
 	} current, pending;
 
 	// FBs in the atomic request, but not yet submitted to KMS
@@ -343,6 +362,7 @@ namespace gamescope
 			std::optional<CDRMAtomicProperty> rotation;
 			std::optional<CDRMAtomicProperty> COLOR_ENCODING;
 			std::optional<CDRMAtomicProperty> COLOR_RANGE;
+			std::optional<CDRMAtomicProperty> COLOR_PIPELINE;
 			std::optional<CDRMAtomicProperty> AMD_PLANE_DEGAMMA_TF;
 			std::optional<CDRMAtomicProperty> AMD_PLANE_DEGAMMA_LUT;
 			std::optional<CDRMAtomicProperty> AMD_PLANE_CTM;
@@ -369,6 +389,8 @@ namespace gamescope
 
 		void RefreshState();
 		uint32_t GetCRTCMask() const { return m_uCRTCMask; }
+		uint32_t GetGammaSize() const { return m_uGammaSize; }
+		uint32_t GetDegammaSize() const { return m_uDegammaSize; }
 
 		struct CRTCProperties
 		{
@@ -390,6 +412,8 @@ namespace gamescope
 	private:
 		CAutoDeletePtr<drmModeCrtc> m_pCRTC;
 		uint32_t m_uCRTCMask = 0u;
+		uint32_t m_uGammaSize = 0;
+		uint32_t m_uDegammaSize = 0;
 		CRTCProperties m_Props;
 	};
 
@@ -646,6 +670,10 @@ extern std::string g_reshade_effect;
 
 bool drm_update_color_mgmt(struct drm_t *drm);
 bool drm_supports_color_mgmt(struct drm_t *drm);
+bool drm_supports_amd_color_mgmt(struct drm_t *drm);
+static void drm_init_generic_color(struct drm_t *drm);
+static int drm_prepare_generic_color(struct drm_t *drm, const FrameInfo_t *frameInfo,
+	const std::function<int()> &apply);
 bool drm_supports_srgb_to_pq(struct drm_t *drm);
 bool drm_set_connector( struct drm_t *drm, gamescope::CDRMConnector *conn );
 
@@ -1673,6 +1701,7 @@ bool init_drm(struct drm_t *drm, int fd, int width, int height, int refresh)
 	if (!get_resources(drm)) {
 		return false;
 	}
+	drm_init_generic_color(drm);
 
 	drm->lo_device = liftoff_device_create( drm->fd );
 	if ( drm->lo_device == nullptr )
@@ -1923,6 +1952,13 @@ void finish_drm(struct drm_t *drm)
 		//if ( pPlane->GetProperties().zpos )
 		//	pPlane->GetProperties().zpos->SetPendingValue( req, , true );
 
+		if (drm->generic_plane_color)
+		{
+			if (pPlane->GetProperties().COLOR_PIPELINE)
+				pPlane->GetProperties().COLOR_PIPELINE->SetPendingValue(req, 0, true);
+			continue;
+		}
+
 		if ( pPlane->GetProperties().AMD_PLANE_DEGAMMA_TF )
 			pPlane->GetProperties().AMD_PLANE_DEGAMMA_TF->SetPendingValue( req, AMDGPU_TRANSFER_FUNCTION_DEFAULT, true );
 
@@ -1991,6 +2027,11 @@ void finish_drm(struct drm_t *drm)
 		drm->m_VisibleFbIds.clear();
 	}
 	drm->sdr_static_metadata = nullptr;
+	drm->color_program_cache.clear();
+	drm->color_output_cache.clear();
+	drm->color_failed_frames.clear();
+	drm->color_last_roots.clear();
+	drm->color_pipelines.clear();
 	drm->current = drm_t::drm_state_t{};
 	drm->pending = drm_t::drm_state_t{};
 	drm->planes.clear();
@@ -2493,6 +2534,7 @@ namespace gamescope
 			m_Props.rotation                 = CDRMAtomicProperty::Instantiate( "rotation",                 this, *rawProperties );
 			m_Props.COLOR_ENCODING           = CDRMAtomicProperty::Instantiate( "COLOR_ENCODING",           this, *rawProperties );
 			m_Props.COLOR_RANGE              = CDRMAtomicProperty::Instantiate( "COLOR_RANGE",              this, *rawProperties );
+			m_Props.COLOR_PIPELINE           = CDRMAtomicProperty::Instantiate( "COLOR_PIPELINE",           this, *rawProperties );
 			m_Props.AMD_PLANE_DEGAMMA_TF     = CDRMAtomicProperty::Instantiate( "AMD_PLANE_DEGAMMA_TF",     this, *rawProperties );
 			m_Props.AMD_PLANE_DEGAMMA_LUT    = CDRMAtomicProperty::Instantiate( "AMD_PLANE_DEGAMMA_LUT",    this, *rawProperties );
 			m_Props.AMD_PLANE_CTM            = CDRMAtomicProperty::Instantiate( "AMD_PLANE_CTM",            this, *rawProperties );
@@ -2522,6 +2564,10 @@ namespace gamescope
 		if ( rawProperties )
 		{
 			m_Props.ACTIVE              = CDRMAtomicProperty::Instantiate( "ACTIVE",              this, *rawProperties );
+			auto gammaSize = rawProperties->find("GAMMA_LUT_SIZE");
+			auto degammaSize = rawProperties->find("DEGAMMA_LUT_SIZE");
+			m_uGammaSize = gammaSize != rawProperties->end() ? gammaSize->second.ulValue : 0;
+			m_uDegammaSize = degammaSize != rawProperties->end() ? degammaSize->second.ulValue : 0;
 			m_Props.MODE_ID             = CDRMAtomicProperty::Instantiate( "MODE_ID",             this, *rawProperties );
 			m_Props.GAMMA_LUT           = CDRMAtomicProperty::Instantiate( "GAMMA_LUT",           this, *rawProperties );
 			m_Props.DEGAMMA_LUT         = CDRMAtomicProperty::Instantiate( "DEGAMMA_LUT",         this, *rawProperties );
@@ -2998,6 +3044,361 @@ namespace gamescope
 	}
 }
 
+#if defined(DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE) && defined(DRM_MODE_OBJECT_COLOROP)
+static drm_color::Properties drm_color_properties(int fd, uint32_t object, uint32_t type)
+{
+	drm_color::Properties result;
+	drmModeObjectProperties *properties = drmModeObjectGetProperties(fd, object, type);
+	if (!properties) return result;
+	defer(drmModeFreeObjectProperties(properties));
+	for (uint32_t i = 0; i < properties->count_props; i++)
+	{
+		drmModePropertyRes *property = drmModeGetProperty(fd, properties->props[i]);
+		if (!property) continue;
+		defer(drmModeFreeProperty(property));
+		drm_color::Property value{property->prop_id, properties->prop_values[i],
+			bool(property->flags & DRM_MODE_PROP_IMMUTABLE), {}};
+		for (int j = 0; j < property->count_enums; j++)
+			value.enums[property->enums[j].name] = property->enums[j].value;
+		result[property->name] = std::move(value);
+	}
+	return result;
+}
+#endif
+
+static void drm_init_generic_color(struct drm_t *drm)
+{
+	// Choose the private API before enabling the mutually exclusive client cap.
+	for (const auto &plane : drm->planes)
+	{
+		const auto &p = plane->GetProperties();
+		if (p.type && p.type->GetCurrentValue() == DRM_PLANE_TYPE_PRIMARY &&
+			p.AMD_PLANE_CTM && p.AMD_PLANE_DEGAMMA_TF && p.AMD_PLANE_SHAPER_TF &&
+			p.AMD_PLANE_SHAPER_LUT && p.AMD_PLANE_LUT3D && !g_bForceDisableColorMgmt)
+		{
+			drm_log.infof("Color API: AMD private (generic CRTC available for incompatible outputs)");
+			return;
+		}
+	}
+#if defined(DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE) && defined(DRM_MODE_OBJECT_COLOROP)
+	if (!g_bForceDisableColorMgmt && drmSetClientCap(drm->fd, DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE, 1) == 0)
+	{
+		drm->generic_plane_color = true;
+		for (const auto &plane : drm->planes)
+		{
+			plane->RefreshState();
+			auto properties = drm_color_properties(drm->fd, plane->GetObjectId(), DRM_MODE_OBJECT_PLANE);
+			auto roots = properties.find("COLOR_PIPELINE");
+			if (roots == properties.end()) continue;
+			for (const auto &[name, root] : roots->second.enums)
+			{
+				if (!root || root > UINT32_MAX) continue;
+				drm_color::Pipeline pipeline{plane->GetObjectId(), root, {}};
+				std::unordered_set<uint32_t> visited;
+				uint32_t id = root;
+				while (id && visited.insert(id).second && visited.size() <= 256)
+				{
+					auto props = drm_color_properties(drm->fd, id, DRM_MODE_OBJECT_COLOROP);
+					auto type = props.find("TYPE"), next = props.find("NEXT");
+					if (type == props.end() || next == props.end() || next->second.value > UINT32_MAX) break;
+					std::string typeName;
+					for (const auto &[label, value] : type->second.enums)
+						if (value == type->second.value) typeName = label;
+					const uint32_t operationId = id;
+					id = next->second.value;
+					pipeline.operations.push_back({operationId, typeName, std::move(props)});
+				}
+				if (drm_color::ValidPipeline(pipeline))
+					drm->color_pipelines[plane->GetObjectId()].push_back(std::move(pipeline));
+			}
+		}
+		if (drm->color_pipelines.empty())
+		{
+			drmSetClientCap(drm->fd, DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE, 0);
+			drm->generic_plane_color = false;
+		}
+	}
+#endif
+	drm_log.infof("Color API: %s; frame eligibility is checked atomically",
+		drm->generic_plane_color ? "generic plane pipelines + CRTC" : "generic CRTC");
+	if (drm->is_nvidia)
+		drm_log.infof("NVIDIA retains forced composition and Vulkan color management");
+}
+
+static std::shared_ptr<gamescope::BackendBlob> drm_color_blob(std::span<const uint8_t> data)
+{
+	return GetBackend()->CreateBackendBlob(typeid(drm_color::Program), data);
+}
+
+static bool drm_upload_color_program(DRMColorCandidate &candidate)
+{
+	for (auto &write : candidate.program)
+	{
+		if (write.blob.empty()) continue;
+		auto blob = drm_color_blob(write.blob);
+		if (!blob) return false;
+		write.value = blob->GetBlobValue();
+		candidate.blobs.push_back(std::move(blob));
+	}
+	return true;
+}
+
+static bool drm_add_crtc_color(DRMColorCandidate &candidate, gamescope::CDRMCRTC *crtc,
+	const drm_color::CrtcProgram &program)
+{
+	const auto &props = crtc->GetProperties();
+	const std::vector<uint8_t> *blobs[] = {&program.degamma, &program.ctm, &program.gamma};
+	const std::optional<gamescope::CDRMAtomicProperty> *properties[] = {&props.DEGAMMA_LUT, &props.CTM, &props.GAMMA_LUT};
+	for (int i = 0; i < 3; i++)
+	{
+		if (!*properties[i])
+		{
+			if (!blobs[i]->empty()) return false;
+			continue;
+		}
+		candidate.program.push_back({crtc->GetObjectId(), (*properties[i])->GetPropertyId(), 0, *blobs[i]});
+	}
+	return true;
+}
+
+static bool drm_single_opaque_color_layer(const FrameInfo_t *frame)
+{
+	if (frame->layers.count() != 1) return false;
+	const auto &layer = frame->layers[0];
+	return layer.opacity == 1.f && (!layer.hasAlpha() || layer.eAlphaBlendingMode == ALPHA_BLENDING_MODE_NONE) &&
+		layer.offset.x == 0.f && layer.offset.y == 0.f &&
+		layer.integerWidth() == uint32_t(g_nOutputWidth) && layer.integerHeight() == uint32_t(g_nOutputHeight);
+}
+
+static int drm_prepare_generic_color(struct drm_t *drm, const FrameInfo_t *frame,
+	const std::function<int()> &apply)
+{
+	using namespace drm_color;
+	auto reject = [&](const char *reason)
+	{
+		if (drm->color_failure != reason)
+		{
+			drm_log.debugf("Color scanout requires composition: %s", reason);
+			drm->color_failure = reason;
+		}
+		return -EINVAL;
+	};
+	if (!drm->pCRTC) return -EINVAL;
+	if (drm->color_cache_serial != g_ColorMgmt.serial || drm->needs_modeset ||
+		drm->color_program_cache.size() > 64 || drm->color_failed_frames.size() > 256)
+	{
+		drm->color_program_cache.clear();
+		drm->color_output_cache.clear();
+		drm->color_failed_frames.clear();
+		drm->color_cache_serial = g_ColorMgmt.serial;
+	}
+	const bool blend = frame->applyOutputColorMgmt && !frame->blendInDisplayEncoding &&
+		!drm_single_opaque_color_layer(frame);
+	const int count = frame->layers.count();
+	const auto geometry = FrameInfoToLiftoffStateCacheEntry(drm, frame);
+	std::vector<uint64_t> frameKey{uint64_t(count), uint64_t(drm->flags)};
+	std::vector<const std::vector<DRMColorCandidate> *> candidates;
+	std::vector<Stage> outputStages;
+	if (blend)
+		outputStages.push_back(Transfer(frame->outputEncodingEOTF == EOTF_PQ ? Curve::PQNormalizedEncode : Curve::SRGBEncode));
+	const auto &crtcProps = drm->pCRTC->GetProperties();
+	std::vector<uint64_t> outputKey{drm->pCRTC->GetObjectId(), uint64_t(blend), uint64_t(frame->outputEncodingEOTF),
+		drm->pCRTC->GetDegammaSize(), uint64_t(bool(crtcProps.CTM)), drm->pCRTC->GetGammaSize()};
+	auto [outputEntry, newOutput] = drm->color_output_cache.try_emplace(outputKey);
+	if (newOutput)
+		outputEntry->second = CompileCRTC(outputStages, drm->pCRTC->GetDegammaSize(), bool(crtcProps.CTM), drm->pCRTC->GetGammaSize());
+	const auto &output = outputEntry->second;
+	if (!output) return reject("CRTC cannot encode the shared linear-light blend space at the required precision");
+
+	for (int i = 0; i < k_nMaxLayers; i++)
+		liftoff_layer_unset_property(drm->lo_layers[i], "COLOR_PIPELINE");
+	for (const auto &plane : drm->planes)
+		if (drm->generic_plane_color && plane->GetProperties().COLOR_PIPELINE)
+			plane->GetProperties().COLOR_PIPELINE->SetPendingValue(drm->req, 0, true);
+
+	for (int i = 0; i < count; i++)
+	{
+		const auto &layer = frame->layers[i];
+		Transform transform;
+		transform.input = layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB ? Encoding::ScRGB :
+			layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ ? Encoding::PQ :
+			layer.colorspace == GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU ? Encoding::Passthrough : Encoding::SDR;
+		transform.output = frame->outputEncodingEOTF;
+		transform.managed = frame->applyOutputColorMgmt && layer.applyColorMgmt && !layer.outputColorMgmtApplied;
+		transform.blend = blend;
+		if (transform.managed && g_bForceDisableColorMgmt) return reject("hardware color management is disabled");
+		const auto &luts = g_ColorMgmtLuts[ColorSpaceToEOTFIndex(layer.colorspace)];
+		if (transform.managed)
+		{
+			if (!luts.HasLuts()) return reject("color LUTs are unavailable");
+			transform.shaper = luts.lut1d;
+			transform.cube = luts.lut3d;
+			transform.analytic = luts.matrixTransform;
+		}
+		if (layer.ctm && !cv_drm_debug_disable_ctm)
+		{
+			const auto &matrix = layer.ctm->View<glm::mat3x4>();
+			Matrix converted;
+			for (int row = 0; row < 3; row++)
+				for (int col = 0; col < 4; col++) converted[4 * row + col] = matrix[row][col];
+			if (converted != Identity()) transform.ctm = converted;
+		}
+		std::vector<uint64_t> key{uint64_t(drm->pCRTC->GetObjectId()), uint64_t(layer.colorspace),
+			uint64_t(frame->outputEncodingEOTF), uint64_t(transform.managed), uint64_t(blend), uint64_t(layer.isYcbcr()),
+			uint64_t(drm_single_opaque_color_layer(frame)), uint64_t(g_bForceDisableColorMgmt)};
+		if (transform.ctm)
+			for (double value : *transform.ctm) { uint64_t bits; std::memcpy(&bits, &value, sizeof(bits)); key.push_back(bits); }
+		const auto &entry = geometry;
+		key.push_back(entry.layerState[i].colorEncoding);
+		key.push_back(entry.layerState[i].colorRange);
+		frameKey.push_back(key.size());
+		frameKey.insert(frameKey.end(), key.begin(), key.end());
+		const auto &g = geometry.layerState[i];
+		frameKey.insert(frameKey.end(), {g.zpos, g.srcW, g.srcH, g.crtcX, g.crtcY, g.crtcW, g.crtcH,
+			g.opacity, uint64_t(g.eAlphaBlendingMode), layer.tex->drmFormat(), layer.tex->dmabuf().modifier});
+		auto [cache, inserted] = drm->color_program_cache.try_emplace(key);
+		if (inserted)
+		{
+			auto variants = BuildVariants(transform);
+			const bool yuv = drm->generic_plane_color && layer.isYcbcr();
+			for (auto &[plane, pipelines] : drm->color_pipelines)
+			{
+				auto physical = std::find_if(drm->planes.begin(), drm->planes.end(),
+					[&](const auto &p) { return p->GetObjectId() == plane; });
+				if (physical == drm->planes.end() || !((*physical)->GetModePlane()->possible_crtcs & drm->pCRTC->GetCRTCMask())) continue;
+				for (const auto &pipeline : pipelines)
+					for (auto stages : variants)
+					{
+						if (yuv)
+						{
+							Stage conversion;
+							conversion.type = Stage::Type::FixedMatrix;
+							const auto encoding = entry.layerState[i].colorEncoding;
+							conversion.fixedMatrix = std::string("YCbCr ") +
+								(encoding == DRM_COLOR_YCBCR_BT601 ? "601" : encoding == DRM_COLOR_YCBCR_BT2020 ? "2020 NC" : "709") +
+								(entry.layerState[i].colorRange == DRM_COLOR_YCBCR_FULL_RANGE ? " Full to RGB" : " Limited to RGB");
+							stages.insert(stages.begin(), std::move(conversion));
+						}
+						auto program = Compile(pipeline, stages);
+						DRMColorCandidate candidate{plane, pipeline.root, {}, {}};
+						if (program)
+						{
+							candidate.program = std::move(*program);
+							if (drm_add_crtc_color(candidate, drm->pCRTC, *output) && drm_upload_color_program(candidate))
+								cache->second.push_back(std::move(candidate));
+						}
+						// A single opaque plane may use the CRTC for its final curve.
+						else if (!blend && drm_single_opaque_color_layer(frame) && !stages.empty() && stages.back().type == Stage::Type::Curve)
+						{
+							auto tail = CompileCRTC(std::span<const Stage>(&stages.back(), 1), 0, false, drm->pCRTC->GetGammaSize());
+							stages.pop_back();
+							program = Compile(pipeline, stages);
+							if (tail && program)
+							{
+								candidate.program = std::move(*program);
+								if (drm_add_crtc_color(candidate, drm->pCRTC, *tail) && drm_upload_color_program(candidate))
+								cache->second.push_back(std::move(candidate));
+							}
+						}
+					}
+			}
+			// CRTC-only color is safe only for one opaque, screen-filling RGB
+			// plane. It cannot replace independent transforms before blending.
+			if (!layer.isYcbcr() || !drm->generic_plane_color)
+				for (const auto &stages : variants)
+				{
+					if (!stages.empty() && (!drm_single_opaque_color_layer(frame) || transform.input == Encoding::ScRGB)) continue;
+					auto crtc = CompileCRTC(stages, drm->pCRTC->GetDegammaSize(), bool(crtcProps.CTM), drm->pCRTC->GetGammaSize());
+					DRMColorCandidate candidate;
+					if (crtc && drm_add_crtc_color(candidate, drm->pCRTC, *crtc) && drm_upload_color_program(candidate))
+						cache->second.push_back(std::move(candidate));
+				}
+		}
+		if (cache->second.empty()) return reject(layer.isYcbcr() ?
+			"no pipeline can preserve YCbCr conversion and the requested color stages" :
+			"available LUT sizes/precision, matrices, or transfer functions cannot represent the complete layer transform");
+		candidates.push_back(&cache->second);
+	}
+	if (is_liftoff_caching_enabled() && drm->color_failed_frames.contains(frameKey))
+		return -EINVAL;
+	// Every root enum value belongs to its physical plane. Normal libliftoff
+	// enum validation therefore enforces the mapping, without a private hook.
+	const int cursor = drmModeAtomicGetCursor(drm->req);
+	std::unordered_set<uint32_t> used;
+	std::vector<const DRMColorCandidate *> selection;
+	int result = -EINVAL;
+	auto assign = [&](auto &&self, int layer) -> bool
+	{
+		if (layer < count)
+		{
+			const uint64_t preferred = drm->color_last_roots.size() == size_t(count) ? drm->color_last_roots[layer] : UINT64_MAX;
+			for (int pass = 0; pass < 2; pass++)
+			for (const auto &candidate : *candidates[layer])
+			{
+				if ((candidate.root == preferred) != (pass == 0)) continue;
+				if (candidate.plane && used.contains(candidate.plane)) continue;
+				if (candidate.plane) used.insert(candidate.plane);
+				selection.push_back(&candidate);
+				if (self(self, layer + 1)) return true;
+				selection.pop_back();
+				used.erase(candidate.plane);
+			}
+			return false;
+		}
+		drmModeAtomicSetCursor(drm->req, cursor);
+		drm->pending.generic_color_blobs.clear();
+		for (int i = 0; i < count; i++)
+		{
+			const auto &candidate = *selection[i];
+			if (drm->generic_plane_color)
+				liftoff_layer_set_property(drm->lo_layers[i], "COLOR_PIPELINE", candidate.root);
+			for (const auto &write : candidate.program)
+				if (drmModeAtomicAddProperty(drm->req, write.object, write.property, write.value) < 0) return false;
+			drm->pending.generic_color_blobs.insert(drm->pending.generic_color_blobs.end(), candidate.blobs.begin(), candidate.blobs.end());
+		}
+		result = apply();
+		if (result == 0 && liftoff_output_needs_composition(drm->lo_output)) result = -EINVAL;
+		// Stop on session loss or permission errors; the caller handles its
+		// existing fence workaround and VT switch behavior.
+		return result == 0 || result == -EACCES || result == -EPERM;
+	};
+	assign(assign, 0);
+	if (result == 0)
+	{
+		// Only publish pending property values after libliftoff has accepted
+		// the complete mapping. Candidate tests must not update these trackers.
+		for (int i = 0; i < count; i++)
+		{
+			const auto &candidate = *selection[i];
+			if (drm->generic_plane_color)
+			{
+				auto *mapped = liftoff_layer_get_plane(drm->lo_layers[i]);
+				if (!mapped) return -EINVAL;
+				const uint32_t planeId = liftoff_plane_get_id(mapped);
+				for (const auto &plane : drm->planes)
+					if (plane->GetObjectId() == planeId && plane->GetProperties().COLOR_PIPELINE &&
+						plane->GetProperties().COLOR_PIPELINE->SetPendingValue(drm->req, candidate.root, false) < 0)
+						return -ENOMEM;
+			}
+			auto &properties = drm->pCRTC->GetProperties();
+			std::optional<gamescope::CDRMAtomicProperty> *tracked[] = {&properties.DEGAMMA_LUT, &properties.CTM, &properties.GAMMA_LUT};
+			for (const auto &write : candidate.program)
+				if (write.object == drm->pCRTC->GetObjectId())
+					for (auto *property : tracked)
+						if (*property && (*property)->GetPropertyId() == write.property &&
+							(*property)->SetPendingValue(drm->req, write.value, false) < 0)
+							return -ENOMEM;
+		}
+		drm->color_last_roots.clear();
+		for (const auto *candidate : selection) drm->color_last_roots.push_back(candidate->root);
+		return 0;
+	}
+	if (result == -EACCES || result == -EPERM) return result;
+	if (result == -EINVAL && is_liftoff_caching_enabled()) drm->color_failed_frames.insert(std::move(frameKey));
+	drmModeAtomicSetCursor(drm->req, cursor);
+	return reject("atomic testing rejected all compatible color pipeline mappings");
+}
+
 static int
 drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, bool needs_modeset )
 {
@@ -3006,10 +3407,17 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 	// If we are modesetting, reset the state cache, we might
 	// move to another CRTC or whatever which might have differing caps.
 	// (same with different modes)
-	if (needs_modeset)
+	if (needs_modeset || drm->color_cache_serial != g_ColorMgmt.serial)
+	{
 		g_LiftoffStateCache.clear();
+		drm->color_program_cache.clear();
+		drm->color_output_cache.clear();
+		drm->color_failed_frames.clear();
+		drm->color_last_roots.clear();
+		drm->color_cache_serial = g_ColorMgmt.serial;
+	}
 
-	if (is_liftoff_caching_enabled())
+	if (is_liftoff_caching_enabled() && drm_supports_amd_color_mgmt(drm))
 	{
 		if (g_LiftoffStateCache.count(entry) != 0)
 			return -EINVAL;
@@ -3096,7 +3504,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			{
 				bool bYCbCr = entry.layerState[i].ycbcr;
 
-				if ( !cv_drm_debug_disable_color_encoding && bYCbCr )
+				if ( !drm->generic_plane_color && !cv_drm_debug_disable_color_encoding && bYCbCr )
 				{
 					liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_ENCODING", entry.layerState[i].colorEncoding );
 				}
@@ -3105,7 +3513,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 					liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_ENCODING" );
 				}
 
-				if ( !cv_drm_debug_disable_color_range && bYCbCr )
+				if ( !drm->generic_plane_color && !cv_drm_debug_disable_color_range && bYCbCr )
 				{
 					liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_RANGE",    entry.layerState[i].colorRange );
 				}
@@ -3114,7 +3522,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 					liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
 				}
 
-				if ( drm_supports_color_mgmt( drm ) )
+				if ( drm_supports_amd_color_mgmt( drm ) )
 				{
 					amdgpu_transfer_function degamma_tf = colorspace_to_plane_degamma_tf( entry.layerState[i].colorspace );
 					amdgpu_transfer_function shaper_tf = colorspace_to_plane_shaper_tf( entry.layerState[i].colorspace );
@@ -3157,7 +3565,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			}
 			else
 			{
-				if ( drm_supports_color_mgmt( drm ) )
+				if ( drm_supports_amd_color_mgmt( drm ) )
 				{
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_DEGAMMA_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_LUT", 0 );
@@ -3167,14 +3575,14 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				}
 			}
 
-			if  ( drm_supports_srgb_to_pq( drm ) )
+			if  ( drm_supports_amd_color_mgmt(drm) && drm_supports_srgb_to_pq( drm ) )
 			{
 				if (!cv_drm_debug_disable_blend_tf && !bSinglePlane)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", drm->pending.output_tf );
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );	
 			}
-			if ( drm_supports_color_mgmt( drm ) )
+			if ( drm_supports_amd_color_mgmt( drm ) )
 			{
 				if (!cv_drm_debug_disable_ctm && frameInfo->layers[i].ctm != nullptr)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", frameInfo->layers[i].ctm->GetBlobValue() );
@@ -3191,11 +3599,11 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
 			liftoff_layer_unset_property( drm->lo_layers[ i ], "pixel blend mode" );
 
-			if ( drm_supports_srgb_to_pq( drm ) )
+			if ( drm_supports_amd_color_mgmt(drm) && drm_supports_srgb_to_pq( drm ) )
 			{
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 			}
-			if ( drm_supports_color_mgmt( drm ) )
+			if ( drm_supports_amd_color_mgmt( drm ) )
 			{
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_DEGAMMA_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 				liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_LUT", 0 );
@@ -3210,7 +3618,8 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 		.timeout_ns = std::numeric_limits<int64_t>::max()
 	};
 
-	int ret = liftoff_output_apply( drm->lo_output, drm->req, drm->flags, &lo_options);
+	auto apply = [&]() { return liftoff_output_apply( drm->lo_output, drm->req, drm->flags, &lo_options ); };
+	int ret = drm_supports_amd_color_mgmt(drm) ? apply() : drm_prepare_generic_color(drm, frameInfo, apply);
 
 	// The NVIDIA 555 series drivers started advertising DRM_CAP_SYNCOBJ, but do
 	// not support IN_FENCE_FD. However, there is no way to hide the IN_FENCE_FD
@@ -3232,7 +3641,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_set_property( drm->lo_layers[ i ], "IN_FENCE_FD", -1 );
 		}
 
-		ret = liftoff_output_apply( drm->lo_output, drm->req, drm->flags, &lo_options );
+		ret = drm_supports_amd_color_mgmt(drm) ? apply() : drm_prepare_generic_color(drm, frameInfo, apply);
 
 		if ( ret == 0 )
 		{
@@ -3251,7 +3660,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 	// If we aren't modesetting and we got -EINVAL, that means that we
 	// probably can't do this layout, so add it to our state cache so we don't
 	// try it again.
-	if (!needs_modeset)
+	if (!needs_modeset && drm_supports_amd_color_mgmt(drm))
 	{
 		if (ret == -EINVAL)
 			g_LiftoffStateCache.insert(entry);
@@ -3411,7 +3820,7 @@ int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameI
 
 	bool bSinglePlane = frameInfo->layers.count() < 2 && cv_drm_single_plane_optimizations;
 
-	if ( drm_supports_srgb_to_pq( &g_DRM ) && frameInfo->applyOutputColorMgmt )
+	if ( drm_supports_amd_color_mgmt(drm) && drm_supports_srgb_to_pq( drm ) && frameInfo->applyOutputColorMgmt )
 	{
 		if ( !cv_drm_debug_disable_output_tf && !bSinglePlane )
 		{
@@ -3718,7 +4127,7 @@ gamescope::GamescopeScreenType drm_get_screen_type(struct drm_t *drm)
 
 bool drm_update_color_mgmt(struct drm_t *drm)
 {
-	if ( !drm_supports_color_mgmt( drm ) )
+	if ( !drm_supports_amd_color_mgmt( drm ) )
 		return true;
 
 	if ( g_ColorMgmt.serial == drm->current.color_mgmt_serial )
@@ -3989,21 +4398,34 @@ std::pair<uint32_t, uint32_t> drm_get_connector_identifier(struct drm_t *drm)
 	return std::make_pair(drm->pConnector->GetModeConnector()->connector_type, drm->pConnector->GetModeConnector()->connector_type_id);
 }
 
-bool drm_supports_color_mgmt(struct drm_t *drm)
+bool drm_supports_amd_color_mgmt(struct drm_t *drm)
 {
+	if (drm->generic_plane_color)
+		return false;
 	if ( g_bForceDisableColorMgmt )
 		return false;
 
 	if ( !drm->pPrimaryPlane )
 		return false;
 
-	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_CTM.has_value() &&         // dm->dc->caps.color.mpc.gamut_remap
+	return drm->pPrimaryPlane->GetProperties().AMD_PLANE_SHAPER_TF.has_value() &&
+			drm->pPrimaryPlane->GetProperties().AMD_PLANE_LUT3D.has_value() &&
+			drm->pPrimaryPlane->GetProperties().AMD_PLANE_CTM.has_value() &&         // dm->dc->caps.color.mpc.gamut_remap
 			drm->pPrimaryPlane->GetProperties().AMD_PLANE_SHAPER_LUT.has_value() && // dpp_color_caps.hw_3d_lut
 			drm->pPrimaryPlane->GetProperties().AMD_PLANE_DEGAMMA_TF.has_value();   // dpp_color_caps.dgam_ram || dpp_color_caps.gamma_corr
 }
 
+bool drm_supports_color_mgmt(struct drm_t *drm)
+{
+	if (g_bForceDisableColorMgmt) return false;
+	return drm_supports_amd_color_mgmt(drm) || !drm->color_pipelines.empty() ||
+		(drm->pCRTC && drm->pCRTC->GetProperties().GAMMA_LUT && drm->pCRTC->GetGammaSize() >= 2);
+}
+
 bool drm_supports_srgb_to_pq(struct drm_t *drm)
 {
+	// Generic eligibility is decided for the complete frame during atomic testing.
+	if (!drm_supports_amd_color_mgmt(drm)) return drm_supports_color_mgmt(drm);
 	if ( g_bForceDisableColorMgmt )
 		return false;
 
@@ -4302,6 +4724,10 @@ namespace gamescope
 
 				return Commit( pFrameInfo );
 			}
+
+			// Generic color rejection uses the existing full composition fallback.
+			if (!drm_supports_amd_color_mgmt(&g_DRM))
+				bNeedsFullComposite = true;
 
 			// Composition Path
 			if ( kDisablePartialComposition )
