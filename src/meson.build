@@ -46,7 +46,8 @@ glsl_compiler = find_program('glslang', 'glslangValidator', native: true)
 
 # Use --depfile to rebuild shaders when included files have changed. Sadly debian based
 # distros don't have up-to-date glslang so we need to check for support first.
-if run_command(glsl_compiler, ['--version', '--depfile', 'dummy.dep'], check: false).returncode() == 0
+glsl_depfile_supported = run_command(glsl_compiler, ['--version', '--depfile', 'dummy.dep'], check: false).returncode() == 0
+if glsl_depfile_supported
   glsl_generator = generator(
     glsl_compiler,
     output    : ['@BASENAME@.h'],
@@ -102,10 +103,14 @@ shader_src = [
 spirv_shaders = [glsl_generator.process(shader_src)]
 
 # Keep typed shaders for GPUs without shaderStorageImageWriteWithoutFormat.
+formatless_args = ['-V', '-Os', '-DVKR_FORMATLESS=1', '@INPUT@', '--vn', '@BASENAME@_formatless', '-o', '@OUTPUT@']
+if glsl_depfile_supported
+  formatless_args += ['--depfile', '@DEPFILE@', '--quiet']
+endif
 formatless_generator = generator(
   glsl_compiler,
   output: ['@BASENAME@_formatless.h'],
-  arguments: ['-V', '-Os', '-DVKR_FORMATLESS=1', '@INPUT@', '--vn', '@BASENAME@_formatless', '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', '--quiet'],
+  arguments: formatless_args,
   depfile: '@BASENAME@_formatless.h.d',
 )
 foreach shader : shader_src

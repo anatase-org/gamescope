@@ -713,6 +713,7 @@ bool CVulkanDevice::createDevice()
 		m_bSupportsModifiers = false;
 	}
 
+	VkBool32 storageImageExtendedFormats = VK_FALSE;
 	{
 		VkPhysicalDeviceVulkan13Features vulkan13Features = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -742,6 +743,7 @@ bool CVulkanDevice::createDevice()
 			dotProductProperties.integerDotProduct8BitUnsignedAccelerated;
 		m_bSupportsStorageImageReadWithoutFormat = features2.features.shaderStorageImageReadWithoutFormat;
 		m_bSupportsStorageImageWriteWithoutFormat = features2.features.shaderStorageImageWriteWithoutFormat;
+		storageImageExtendedFormats = features2.features.shaderStorageImageExtendedFormats;
 	}
 
 	float queuePriorities = 1.0f;
@@ -859,6 +861,7 @@ bool CVulkanDevice::createDevice()
 	features2.features.shaderInt16 = m_bSupportsFp16;
 	features2.features.shaderStorageImageReadWithoutFormat = m_bSupportsStorageImageReadWithoutFormat;
 	features2.features.shaderStorageImageWriteWithoutFormat = m_bSupportsStorageImageWriteWithoutFormat;
+	features2.features.shaderStorageImageExtendedFormats = storageImageExtendedFormats;
 
 	VkDeviceCreateInfo deviceCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
