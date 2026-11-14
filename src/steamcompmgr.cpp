@@ -2637,7 +2637,7 @@ static void paint_pipewire()
 		pFocus = GetCurrentFocus();
 	}
 
-	if ( !pFocus->focusWindow )
+	if ( !pFocus || !pFocus->focusWindow )
 		return;
 
 	const bool bAppIdMatches = !ulFocusAppId || pFocus->focusWindow->appID == ulFocusAppId;
@@ -2683,13 +2683,13 @@ static void paint_pipewire()
 	currentOutputHeight = uHeight;
 
 	// Paint the windows we have onto the Pipewire stream.
-	paint_window( pFocus, pFocus->focusWindow, pFocus->focusWindow, &frameInfo, nullptr, 0, 1.0f, pFocus->overrideWindow );
+	paint_window( nullptr, pFocus->focusWindow, pFocus->focusWindow, &frameInfo, nullptr, 0, 1.0f, pFocus->overrideWindow );
 
 	if ( pFocus->overrideUnderlayWindow && !pFocus->focusWindow->isSteamStreamingClient )
-		paint_window( pFocus, pFocus->overrideUnderlayWindow, pFocus->focusWindow, &frameInfo, nullptr, PaintWindowFlag::NoFilter, 1.0f, pFocus->overrideWindow );
+		paint_window( nullptr, pFocus->overrideUnderlayWindow, pFocus->focusWindow, &frameInfo, nullptr, PaintWindowFlag::NoFilter, 1.0f, pFocus->overrideWindow );
 
 	if ( pFocus->overrideWindow && !pFocus->focusWindow->isSteamStreamingClient )
-		paint_window( pFocus, pFocus->overrideWindow, pFocus->focusWindow, &frameInfo, nullptr,
+		paint_window( nullptr, pFocus->overrideWindow, pFocus->focusWindow, &frameInfo, nullptr,
 			PaintWindowFlag::NoFilter | PaintWindowFlag::ClampToOutput, 1.0f, pFocus->overrideWindow );
 
 	if ( !pFocus->focusWindow->isSteamStreamingClient )
@@ -2703,13 +2703,13 @@ static void paint_pipewire()
 				break;
 
 			if ( decoration->opacity )
-				paint_window( pFocus, decoration, pFocus->focusWindow, &frameInfo, nullptr, PaintWindowFlag::NoFilter, 1.0f, decoration );
+				paint_window( nullptr, decoration, pFocus->focusWindow, &frameInfo, nullptr, PaintWindowFlag::NoFilter, 1.0f, decoration );
 		}
 	}
 
 	if ( !ulFocusAppId && pFocus->overlayWindow && pFocus->overlayWindow->opacity )
 	{
-		paint_window( pFocus, pFocus->overlayWindow, pFocus->overlayWindow, &frameInfo, nullptr, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
+		paint_window( nullptr, pFocus->overlayWindow, pFocus->overlayWindow, &frameInfo, nullptr, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
 	}
 
@@ -3012,7 +3012,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 
 	// The gate also budgets the override painted right below, which is unguarded.
 	if ( pFocus->overrideUnderlayWindow && w && !w->isSteamStreamingClient && cv_paint_override_redirect_plane &&
-		 frameInfo.layerCount + ( override ? 1 : 0 ) < k_nMaxLayers - nReservedLayers )
+		 frameInfo.layers.count() + ( override ? 1 : 0 ) < k_nMaxLayers - nReservedLayers )
 	{
 		paint_window(pFocus, pFocus->overrideUnderlayWindow, w, &frameInfo, pFocus->cursor, PaintWindowFlag::NoFilter, 1.0f, override);
 	}
@@ -3033,7 +3033,7 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 		{
 			if ( frameInfo.layers.count() >= k_nMaxLayers - nReservedLayers )
 			{
-				focus_log.debugf( "Dropping remaining decoration windows, out of layers" );
+				xwm_log.debugf( "Dropping remaining decoration windows, out of layers" );
 				break;
 			}
 
@@ -4521,12 +4521,12 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 					order.push_back( pWindow->xwayland().id );
 			}
 			order.push_back( mouseBaseWindow->xwayland().id );
-			inputFocus->Raise();
+			XRaiseWindow( ctx->dpy, inputFocus->xwayland().id );
 			XRestackWindows( ctx->dpy, order.data(), order.size() );
 		}
 	}
 	else if ( ctx->list[0].xwayland().id != inputFocus->xwayland().id )
-		inputFocus->Raise();
+		XRaiseWindow( ctx->dpy, inputFocus->xwayland().id );
 
 	// X confines the pointer to the screen, so a screen-sized focus window only
 	// sees all of it at the origin. Place it there once, a client that moves it

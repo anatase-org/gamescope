@@ -4550,6 +4550,7 @@ bool vulkan_remake_output_images()
 
 	if ( vulkan_defer_output_images() )
 	{
+		pOutput->compositionScratch = nullptr;
 		pOutput->outputImages.clear();
 		pOutput->outputImagesPartialOverlay.clear();
 		pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
