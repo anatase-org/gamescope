@@ -1764,6 +1764,10 @@ void CVulkanDevice::garbageCollect( void )
 	uint64_t currentSeqNo;
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 
+	// Reclaim uploads even when each connector waits on an older submission.
+	if ( currentSeqNo == m_submissionSeqNo )
+		m_uploadBufferOffset = 0;
+
 	resetCmdBuffers(currentSeqNo);
 }
 
