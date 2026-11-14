@@ -2743,7 +2743,7 @@ namespace gamescope
 			else if ( eTag == DI_EDID_DISPLAY_DESCRIPTOR_DATA_STRING )
 			{
 				const char *pszDataString = di_edid_display_descriptor_get_string( pDesc );
-				strncpy( m_Mutable.szDataString, pszDataString, sizeof( m_Mutable.szDataString ) );
+				snprintf( m_Mutable.szDataString, sizeof( m_Mutable.szDataString ), "%s", pszDataString );
 			}
 		}
 
