@@ -6586,9 +6586,8 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 				vulkan_frame_generation_note_source_callback( true );
 			return false;
 		}
-		// Source callbacks own the 60 Hz cadence. Once the midpoint drains and
-		// only its following real frame remains, latch the next source immediately
-		// so generation gets the complete interval before its output slot.
+		// Source callbacks own the cadence. Latch a ready source while the previous
+		// midpoint is queued so generation can run ahead of scanout.
 		if ( !frameCallback )
 			return true;
 		const uint64_t schedule = w->last_commit_first_latch_time +
@@ -11020,10 +11019,8 @@ steamcompmgr_main(int argc, char **argv)
 					{
 						if ( vulkan_frame_generation_has_pending_frame() )
 						{
-							// An empty queue just presented its priming real frame.
-							// Give the first midpoint a full source interval to finish.
 							schedule_frame_generation_output_timer(
-								get_time_in_nanos() + ( frameGenerationPending ? 0 : frameGenerationOutputInterval ),
+								get_time_in_nanos(),
 								frameGenerationOutputInterval );
 						}
 						else

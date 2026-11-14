@@ -6076,7 +6076,6 @@ namespace
 		bool useFSR = false;
 		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
 		uint64_t outputId = 0;
-		uint64_t submissionSequence = 0;
 	};
 
 	static bool FrameGenerationSupportedFormat( VkFormat format )
@@ -6662,12 +6661,12 @@ namespace
 			}
 
 			vulkan_frame_generation_notify_submit( *sequence );
-			generated.submissionSequence = *sequence;
 			if ( !m_pipelinePrimed )
 			{
-				m_queue.push_back( m_previousReal );
+				// Give the first midpoint a full source interval in either output clock.
+				m_queue.insert( m_queue.end(), 2, m_previousReal );
 				m_pipelinePrimed = true;
-				m_telemetry.repeatedRealFrames++;
+				m_telemetry.repeatedRealFrames += 2;
 			}
 			m_queue.push_back( std::move( generated ) );
 			m_previousReal = real;
@@ -6784,16 +6783,9 @@ namespace
 			if ( m_queue.empty() )
 				return;
 
-			if ( m_queue.front().generated &&
-				 m_queue.front().submissionSequence != 0 &&
-				 !g_device.isComplete( m_queue.front().submissionSequence ) )
-			{
-				m_queue.pop_front();
-				m_telemetry.deadlineDroppedFrames++;
-				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::DeadlineMiss );
-				if ( m_queue.empty() )
-					return;
-			}
+			// Scanout and composition wait on the queued acquire point. The
+			// compositor wakes before scanout, so unfinished GPU work here does
+			// not mean the generated frame has missed its presentation deadline.
 
 			FrameGenerationQueuedFrame queued = std::move( m_queue.front() );
 			m_queue.pop_front();
@@ -6876,7 +6868,8 @@ bool vulkan_frame_generation_can_request_source_frame()
 
 bool vulkan_frame_generation_can_accept_source_frame()
 {
-	return s_frameGenerationPacingContext.CanAcceptSourceFrame();
+	return s_frameGenerationPacingContext.CanAcceptSourceFrame() &&
+		vulkan_frame_generation_work_complete();
 }
 
 bool vulkan_frame_generation_drop_stale_generated_frame(

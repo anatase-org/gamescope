@@ -48,7 +48,8 @@ namespace gamescope
 		uint32_t queuedFrames, bool frontFrameGenerated )
 	{
 		return queuedFrames == 0u ||
-			( queuedFrames == 1u && !frontFrameGenerated );
+			( queuedFrames == 1u && !frontFrameGenerated ) ||
+			( queuedFrames == 2u && frontFrameGenerated );
 	}
 
 	constexpr bool FrameGenerationShouldPrecomposeRealFrame(

@@ -85,7 +85,7 @@ int main()
 	assert( FrameGenerationCanAcceptSourceFrame( 0, false ) );
 	assert( FrameGenerationCanAcceptSourceFrame( 1, false ) );
 	assert( !FrameGenerationCanAcceptSourceFrame( 1, true ) );
-	assert( !FrameGenerationCanAcceptSourceFrame( 2, true ) );
+	assert( FrameGenerationCanAcceptSourceFrame( 2, true ) );
 
 	assert( FrameGenerationShouldPrecomposeRealFrame( true, false, true ) );
 	assert( FrameGenerationShouldPrecomposeRealFrame( false, true, true ) );
