@@ -6615,10 +6615,12 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 
 	if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive() )
 	{
-		bool bCloseEnough = !frameGenerationActive &&
-			std::abs( g_nSteamCompMgrTargetFPS - nRefreshHz ) < 2;
-
-		if ( shouldLimit && w && !bCloseEnough )
+		const commit_t *lastCommit = w ? get_window_last_done_commit_peek(w) : nullptr;
+		// Readiness wakes may precede scanout. Keep FIFO and non-tearing
+		// clients paced, including an explicit cap equal to the panel refresh.
+		const bool paceClient = shouldLimit || (bShouldLimitFPS &&
+			(!cv_tearing_enabled || (lastCommit && lastCommit->fifo)));
+		if ( paceClient && w )
 		{
 			uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;
 
