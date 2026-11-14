@@ -239,6 +239,7 @@ struct wlserver_pointer {
 	struct wl_listener button;
 	struct wl_listener axis;
 	struct wl_listener frame;
+	struct wl_listener destroy;
 };
 
 struct wlserver_touch {

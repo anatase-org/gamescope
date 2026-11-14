@@ -571,6 +571,18 @@ static void wlserver_handle_touch_frame(struct wl_listener *listener, void *data
 	wlserver_touchframe();
 }
 
+static void wlserver_handle_pointer_destroy(struct wl_listener *listener, void *data)
+{
+	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, destroy );
+	wl_list_remove( &pointer->motion.link );
+	wl_list_remove( &pointer->motion_absolute.link );
+	wl_list_remove( &pointer->button.link );
+	wl_list_remove( &pointer->axis.link );
+	wl_list_remove( &pointer->frame.link );
+	wl_list_remove( &pointer->destroy.link );
+	free( pointer );
+}
+
 static void wlserver_handle_touch_destroy(struct wl_listener *listener, void *data)
 {
 	struct wlserver_touch *touch = wl_container_of( listener, touch, destroy );
@@ -629,6 +641,8 @@ static void wlserver_new_input(struct wl_listener *listener, void *data)
 			wl_signal_add( &pointer->wlr->events.axis, &pointer->axis);
 			pointer->frame.notify = wlserver_handle_pointer_frame;
 			wl_signal_add( &pointer->wlr->events.frame, &pointer->frame);
+			pointer->destroy.notify = wlserver_handle_pointer_destroy;
+			wl_signal_add( &device->events.destroy, &pointer->destroy );
 		}
 		break;
 		case WLR_INPUT_DEVICE_TOUCH:
