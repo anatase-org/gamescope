@@ -2590,8 +2590,15 @@ void wlserver_run(void)
 	wlserver.bWaylandServerRunning = false;
 	wlserver.bWaylandServerRunning.notify_all();
 
+	wlserver_lock();
 	{
 		std::unique_lock lock3(wlserver.xdg_commit_lock);
+		for ( auto &entry : wlserver.xdg_commit_queue )
+		{
+			wlserver_presentation_feedback_discard( entry.presentation_feedbacks );
+			if ( entry.buf )
+				wlr_buffer_unlock( entry.buf );
+		}
 		wlserver.xdg_commit_queue.clear();
 	}
 
@@ -2605,6 +2612,8 @@ void wlserver_run(void)
 		}
 		wlserver.non_toplevel_commit_queue.clear();
 	}
+
+	wlserver_unlock();
 
 	{
 		std::unique_lock lock2(g_wlserver_xdg_shell_windows_lock);

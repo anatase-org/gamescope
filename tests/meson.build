@@ -32,24 +32,15 @@ test('vblank-schedule', test_vblank_schedule)
 
 if catch2_dep.found()
 	unittest_src = []
-	foreach src : gamescope_core_src + ['Script/Script.cpp', 'convar_script.cpp']
+	foreach src : gamescope_core_src
 		unittest_src += srcdir / src
 	endforeach
-
-	test_convar = executable(
-		'test_convar',
-		unittest_src + ['test_convar.cpp'],
-		include_directories: [srcdir, sol2_include],
-		dependencies: [catch2_dep, luajit_dep, cap_dep, drm_dep, glm_dep, wlroots_dep],
-		cpp_args: gamescope_cpp_args,
-	)
-	test('convar', test_convar)
 	reaper_test_helper = executable('reaper_test_helper', 'reaper_test_helper.cpp')
 	test_process = executable(
-		'test_process', unittest_src + ['test_process.cpp'],
+		'test_process', unittest_src + ['test_process.cpp', gamescope_version],
 		include_directories: [srcdir, sol2_include],
 		dependencies: [catch2_dep, luajit_dep, cap_dep, drm_dep, glm_dep, wlroots_dep],
-		cpp_args: gamescope_cpp_args,
+		cpp_args: ['-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int()), '-DHAVE_SCRIPTING=0', '-fexceptions'],
 	)
 	test('utils/process', test_process, depends: [reaper_test_helper])
 	test_upscale = executable('test_upscale', 'test_upscale.cpp',

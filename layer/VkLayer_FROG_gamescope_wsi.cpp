@@ -1573,7 +1573,7 @@ namespace GamescopeWSILayer {
       bool allLayer = true;
       for (uint32_t i = 0; i < presentInfo.swapchainCount; i++) {
         auto swapchain = GamescopeSwapchain::get(presentInfo.pSwapchains[i]);
-        allLayer &= swapchain != nullptr;
+        allLayer &= bool(swapchain);
         driverModes.push_back(swapchain ? VK_PRESENT_MODE_MAILBOX_KHR :
           (oOriginalPresentModeInfo ? oOriginalPresentModeInfo->pPresentModes[i] : VK_PRESENT_MODE_MAX_ENUM_KHR));
       }

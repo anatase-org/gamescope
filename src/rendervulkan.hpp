@@ -380,8 +380,6 @@ struct FrameInfo_t
 		// Borrowed for the duration of a backend Present call.
 		int acquireFenceFd = -1;
 
-		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
-
 		GamescopeAppTextureColorspace colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
 
 		bool isYcbcr() const

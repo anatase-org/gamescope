@@ -1172,13 +1172,13 @@ bool CVulkanDevice::createShaders()
 	if (m_bSupportsFp16)
 	{
 		if ( m_uVendorID == 0x5143 ) /* Qualcomm */
-	{
-		SHADER(RCAS_FP16, cs_composite_rcas_fp16_1px);
-	}
-	else
-	{
-		SHADER(RCAS_FP16, cs_composite_rcas_fp16);
-	}
+		{
+			SHADER(RCAS_FP16, cs_composite_rcas_fp16_1px);
+		}
+		else
+		{
+			SHADER(RCAS_FP16, cs_composite_rcas_fp16);
+		}
 		SHADER(EASU, cs_easu_fp16);
 		SHADER(EASU_RGBA16F, cs_easu_fp16_rgba16f);
 		SHADER(NIS, cs_nis_fp16);
@@ -1892,6 +1892,14 @@ bool CVulkanCmdBuffer::AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t>
 	if ( !pTimelineSemaphore )
 		return false;
 
+	for ( auto &dependency : m_ExternalDependencies )
+	{
+		if ( dependency.pTimelineSemaphore == pTimelineSemaphore )
+		{
+			dependency.ulPoint = std::max( dependency.ulPoint, ulPoint );
+			return true;
+		}
+	}
 	m_ExternalDependencies.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
 	return true;
 }
@@ -6098,7 +6106,7 @@ namespace
 				m_format != rawSource->format() || m_drmFormat != rawSource->drmFormat() ||
 				m_colorspace != realLayer.colorspace || m_appId != appId ||
 				m_connector != GetBackend()->GetCurrentConnector() || m_config != config ||
-				m_fsrEnabled != fsrEnabled ||
+				m_fsrEnabled != fsrEnabled || m_sgsrEnabled != frameInfo->useSGSRLayer0 ||
 				m_scale.x != realLayer.scale.x || m_scale.y != realLayer.scale.y ||
 				m_offset.x != realLayer.offset.x || m_offset.y != realLayer.offset.y;
 			if ( stateChanged )
@@ -6113,6 +6121,7 @@ namespace
 				m_connector = GetBackend()->GetCurrentConnector();
 				m_config = config;
 				m_fsrEnabled = fsrEnabled;
+				m_sgsrEnabled = frameInfo->useSGSRLayer0;
 				m_scale = realLayer.scale;
 				m_offset = realLayer.offset;
 			}
@@ -6275,7 +6284,9 @@ namespace
 					generatedFrame.layers[0].colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
 				generatedFrame.layers[0].acquirePoint = nullptr;
 				generatedFrame.layers[0].opacity = 1.0f;
-				generatedFrame.useFSRLayer0 = fsrEnabled;
+				generatedFrame.useFSRLayer0 = fsrEnabled && !frameInfo->useSGSRLayer0;
+				generatedFrame.useSGSRLayer0 = fsrEnabled && frameInfo->useSGSRLayer0;
+				generatedFrame.nUpscaleSharpness = frameInfo->nUpscaleSharpness;
 				generatedFrame.applyOutputColorMgmt = fsrEnabled
 					? frameInfo->applyOutputColorMgmt : false;
 				generatedFrame.outputEncodingEOTF = fsrEnabled
@@ -6456,7 +6467,9 @@ namespace
 					realFrame.layers[0] = realLayer;
 					realFrame.layers[0].acquirePoint = nullptr;
 					realFrame.layers[0].opacity = 1.0f;
-					realFrame.useFSRLayer0 = fsrEnabled;
+					realFrame.useFSRLayer0 = fsrEnabled && !frameInfo->useSGSRLayer0;
+					realFrame.useSGSRLayer0 = fsrEnabled && frameInfo->useSGSRLayer0;
+					realFrame.nUpscaleSharpness = frameInfo->nUpscaleSharpness;
 					realFrame.applyOutputColorMgmt = frameInfo->applyOutputColorMgmt;
 					realFrame.outputEncodingEOTF = frameInfo->outputEncodingEOTF;
 					if ( fsrEnabled )
@@ -6662,6 +6675,7 @@ namespace
 			frameInfo->layers[0].acquirePoint = std::move( queued.acquirePoint );
 			frameInfo->useFSRLayer0 = queued.useFSR;
 			frameInfo->useNISLayer0 = false;
+			frameInfo->useSGSRLayer0 = false;
 			frameInfo->frameGenerationActive = true;
 			frameInfo->frameGenerationOutputId = queued.outputId;
 			m_lastPresentedGenerated = queued.generated;
@@ -6694,6 +6708,7 @@ namespace
 		bool m_hasHistory = false;
 		bool m_lastSourceValid = false;
 		bool m_fsrEnabled = false;
+		bool m_sgsrEnabled = false;
 		bool m_lastPresentedGenerated = false;
 		bool m_pipelinePrimed = false;
 		FrameGenerationQueuedFrame m_previousReal;
@@ -6710,7 +6725,7 @@ void vulkan_frame_generation_apply( FrameInfo_t *frameInfo,
 	bool fsrEnabled = false;
 	if ( frameInfo && frameInfo->layers.count() > 0 )
 	{
-		fsrEnabled = frameInfo->useFSRLayer0 ||
+		fsrEnabled = frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 ||
 			( rawSource && frameInfo->layers[0].tex.get() != rawSource.get() &&
 			  frameInfo->layers[0].filter == GamescopeUpscaleFilter::FSR );
 	}

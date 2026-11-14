@@ -3127,8 +3127,10 @@ paint_all(global_focus_t *pFocus, bool async, bool dpms, bool frameGenerationPre
 					// Just draw focused window as normal, be it Steam or the game
 					paint_window(pFocus, w, w, &frameInfo, pFocus->cursor, PaintWindowFlag::BasePlane | PaintWindowFlag::DrawBorders, 1.0f, override);
 
-					bool needsScaling = frameInfo.layers.get( 0 ).scale.x < 0.999f && frameInfo.layers.get( 0 ).scale.y < 0.999f;
-					GamescopeUpscaleFilter eLayer0Filter = ResolveUpscaleFilter( frameInfo.eUpscaleFilter, frameInfo.layers.get( 0 ).colorspace, frameInfo.layers.get( 0 ).isYcbcr() );
+					bool needsScaling = frameInfo.layers.count() > 0 && frameInfo.layers.get( 0 ).scale.x < 0.999f && frameInfo.layers.get( 0 ).scale.y < 0.999f;
+					GamescopeUpscaleFilter eLayer0Filter = frameInfo.layers.count() > 0
+						? ResolveUpscaleFilter( frameInfo.eUpscaleFilter, frameInfo.layers.get( 0 ).colorspace, frameInfo.layers.get( 0 ).isYcbcr() )
+						: GamescopeUpscaleFilter::LINEAR;
 					frameInfo.useFSRLayer0 = eLayer0Filter == GamescopeUpscaleFilter::FSR && needsScaling;
 					frameInfo.useNISLayer0 = eLayer0Filter == GamescopeUpscaleFilter::NIS && needsScaling;
 					frameInfo.useSGSRLayer0 = eLayer0Filter == GamescopeUpscaleFilter::SGSR && needsScaling;
@@ -4213,7 +4215,7 @@ carry_override_underlay( focus_t *pFocus, steamcompmgr_win_t *pPreviousOverride,
 		if ( isUnderlay( underlay ) )
 			pFocus->overrideUnderlayWindows.push_back( underlay );
 		else if ( underlay != pFocus->overrideWindow )
-			xwm_log.debugf( "Override underlay dropped: %s (%x)", underlay->debug_name(), underlay->id() );
+			xwm_log.debugf( "Override underlay dropped: %s (%x)", (underlay->title ? underlay->title->c_str() : ""), underlay->id() );
 	}
 
 	if ( pPreviousOverride && pFocus->focusWindow &&
@@ -4224,7 +4226,7 @@ carry_override_underlay( focus_t *pFocus, steamcompmgr_win_t *pPreviousOverride,
 	{
 		pFocus->overrideUnderlayWindows.push_back( pPreviousOverride );
 		xwm_log.debugf( "Override underlay set: %s (%x)",
-			pPreviousOverride->debug_name(), pPreviousOverride->id() );
+			(pPreviousOverride->title ? pPreviousOverride->title->c_str() : ""), pPreviousOverride->id() );
 	}
 }
 
@@ -4954,7 +4956,7 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	{
 		if ( pFocus->overrideWindow )
 			xwm_log.debugf( "Override pick: %s (%x) override_redirect=%d pid=%d",
-				pFocus->overrideWindow->debug_name(), pFocus->overrideWindow->id(),
+				(pFocus->overrideWindow->title ? pFocus->overrideWindow->title->c_str() : ""), pFocus->overrideWindow->id(),
 				(int)win_is_override_redirect( pFocus->overrideWindow ), pFocus->overrideWindow->pid );
 		else
 			xwm_log.debugf( "Override pick: none" );
@@ -8546,6 +8548,8 @@ static void check_new_non_toplevel_res()
 			{
 				if ( gamescope::IBackendFb *pBackendFb = pTex->GetBackendFb() )
 					pBackendFb->SetReleasePoint( import.pReleasePoint );
+				else
+					pTex->AddReleasePoint( import.pReleasePoint );
 			}
 		}
 	}
