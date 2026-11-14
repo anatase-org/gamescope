@@ -24,6 +24,7 @@ namespace gamescope
             uint64_t ulInterval = 0;
             uint64_t ulOffset = 0;
             uint64_t ulNow = 0;
+            uint64_t ulLateMargin = 0;
             bool bVRR = false;
             bool bRateOverride = false;
         };
@@ -58,7 +59,7 @@ namespace gamescope
 
             const uint64_t ulTargetFloor = TargetFloor( lastSchedule, params );
             uint64_t ulWake = ulAnchor + params.ulInterval - ulOffset;
-            uint64_t ulEarliestWake = params.ulNow;
+            uint64_t ulEarliestWake = params.ulNow - std::min( params.ulNow, params.ulLateMargin );
             if ( ulTargetFloor >= ulOffset )
                 ulEarliestWake = std::max( ulEarliestWake, ulTargetFloor - ulOffset + 1 );
             // Step in one go, a headless session never marks a vblank so the gap grows with uptime.

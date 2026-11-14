@@ -36,7 +36,6 @@ namespace gamescope
 
         int GetRefresh() const;
         uint64_t GetLastVBlank() const;
-        uint64_t GetNextVBlank( uint64_t ulOffset ) const;
         bool IsVRRFlipReady() const;
 
         VBlankScheduleTime CalcNextWakeupTime( bool bPreemptive );
@@ -57,7 +56,7 @@ namespace gamescope
         void OnPollIn() final;
     private:
         VBlankScheduleTime CalcNextWakeupTimeLocked( bool bPreemptive );
-        VBlankScheduleTime m_LastIndependentSchedule{};
+        VBlankScheduleTime m_LastVBlankSchedule{};
 
         void VBlankDebugSpew( uint64_t ulOffset, uint64_t ulDrawTime, uint64_t ulRedZone );
         uint64_t VRRWakeupOffset( uint64_t *pulDrawTime = nullptr, uint64_t *pulRedZone = nullptr ) const;

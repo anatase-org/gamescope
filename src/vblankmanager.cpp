@@ -83,16 +83,6 @@ namespace gamescope
 		return m_ulLastVBlank;
 	}
 
-	uint64_t CVBlankTimer::GetNextVBlank( uint64_t ulOffset ) const
-	{
-		const uint64_t ulIntervalNSecs = mHzToRefreshCycle( GetRefresh() );
-		const uint64_t ulNow = get_time_in_nanos();
-
-		const uint64_t ulLateMargin = m_bCurrentlyCompositing ? m_ulVBlankDrawBufferRedZone : 0;
-		return NextVBlankWakeup( GetLastVBlank(), ulIntervalNSecs, ulOffset,
-			m_ulLastProcessedVBlank, ulNow, ulLateMargin );
-	}
-
 	uint64_t CVBlankTimer::VRRWakeupOffset( uint64_t *pulDrawTime, uint64_t *pulRedZone ) const
 	{
 		uint64_t ulDrawTime = cv_adaptive_sync_uncapped ? m_ulVRRRollingMaxSubmitTime.load() : 0;
@@ -196,24 +186,16 @@ namespace gamescope
 				VBlankDebugSpew( ulOffset, ulDrawTime, ulRedZone );
 		}
 
-		if ( GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0 && !bVRR )
-			return VBlank::Next({
-				.ulLastVBlank = GetLastVBlank(),
-				.ulInterval = ulRefreshInterval,
-				.ulOffset = ulOffset,
-				.ulNow = get_time_in_nanos(),
-				.bRateOverride = true,
-			}, m_LastIndependentSchedule );
-
-		const uint64_t ulScheduledWakeupPoint = GetNextVBlank( ulOffset );
-		const uint64_t ulTargetVBlank = ulScheduledWakeupPoint + ulOffset;
-
-		VBlankScheduleTime schedule =
-		{
-			.ulTargetVBlank = ulTargetVBlank,
-			.ulScheduledWakeupPoint = ulScheduledWakeupPoint,
-		};
-		return schedule;
+		const bool bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0;
+		return VBlank::Next({
+			.ulLastVBlank = GetLastVBlank(),
+			.ulInterval = ulRefreshInterval,
+			.ulOffset = ulOffset,
+			.ulNow = get_time_in_nanos(),
+			.ulLateMargin = !bVRR && !bRateOverride && m_bCurrentlyCompositing ? m_ulVBlankDrawBufferRedZone : 0,
+			.bVRR = bVRR,
+			.bRateOverride = bRateOverride,
+		}, m_LastVBlankSchedule );
 	}
 
 	std::optional<VBlankTime> CVBlankTimer::ProcessVBlank()
@@ -310,7 +292,7 @@ namespace gamescope
 
 
 			m_ulLastProcessedVBlank = m_TimerFDSchedule.ulTargetVBlank;
-			m_LastIndependentSchedule = m_TimerFDSchedule;
+			m_LastVBlankSchedule = m_TimerFDSchedule;
 			m_PendingVBlank = VBlankTime
 			{
 				.schedule = m_TimerFDSchedule,
@@ -364,11 +346,26 @@ namespace gamescope
 				return;
 			}
 
-			std::unique_lock lock( m_ScheduleMutex );
-			m_LastIndependentSchedule = time.schedule;
-			gpuvis_trace_printf( "got vblank" );
-			m_ulLastProcessedVBlank = time.schedule.ulTargetVBlank;
-			m_PendingVBlank = time;
+			{
+				std::unique_lock lock( m_ScheduleMutex );
+				const bool bVRR = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive();
+				const int nNestedRefresh = g_nNestedRefresh;
+				const uint64_t ulTargetFloor = VBlank::TargetFloor( m_LastVBlankSchedule, {
+					.ulInterval = mHzToRefreshCycle( nNestedRefresh ? nNestedRefresh : g_nOutputRefresh ),
+					.bVRR = bVRR,
+					.bRateOverride = GetBackend()->SupportsIndependentRefresh() && nNestedRefresh != 0,
+				} );
+				if ( time.schedule.ulTargetVBlank > ulTargetFloor )
+				{
+					m_LastVBlankSchedule = time.schedule;
+					m_ulLastProcessedVBlank = time.schedule.ulTargetVBlank;
+					gpuvis_trace_printf( "got vblank" );
+					m_PendingVBlank = time;
+					return;
+				}
+			}
+			gpuvis_trace_printf( "Ignoring duplicate vblank... Pre-emptively re-arming." );
+			ArmNextVBlank( true );
 		}
 	}
 
