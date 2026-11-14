@@ -7859,7 +7859,10 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 		}
 		const bool frameGenerationOverlay =
 			steamcompmgr_window_is_active_frame_generation_overlay( entry_window );
-		const bool fifoPaced = entry.fifo || frameGenerationOverlay;
+		// Framegen source commits must obey the queue gate even without FIFO.
+		const bool fifoPaced = entry.fifo || frameGenerationOverlay ||
+			( steamcompmgr_frame_generation_enabled_for_focus() &&
+			  GetCurrentFocus()->focusWindow == entry_window );
 		const bool entry_vblank =
 			( vblank || ( !frameGenerationOverlay &&
 			  steamcompmgr_can_latch_frame_generation_between_vblanks() ) ) &&
@@ -7932,7 +7935,10 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 		}
 		const bool frameGenerationOverlay =
 			steamcompmgr_window_is_active_frame_generation_overlay( entry_window );
-		const bool fifoPaced = entry.fifo || frameGenerationOverlay;
+		// Framegen source commits must obey the queue gate even without FIFO.
+		const bool fifoPaced = entry.fifo || frameGenerationOverlay ||
+			( steamcompmgr_frame_generation_enabled_for_focus() &&
+			  GetCurrentFocus()->focusWindow == entry_window );
 		const bool entry_vblank =
 			( vblank || ( !frameGenerationOverlay &&
 			  steamcompmgr_can_latch_frame_generation_between_vblanks() ) ) &&
@@ -11011,8 +11017,13 @@ steamcompmgr_main(int argc, char **argv)
 					if ( frameGenerationFreeRunning )
 					{
 						if ( vulkan_frame_generation_has_pending_frame() )
+						{
+							// An empty queue just presented its priming real frame.
+							// Give the first midpoint a full source interval to finish.
 							schedule_frame_generation_output_timer(
-								frameGenerationNow, frameGenerationOutputInterval );
+								get_time_in_nanos() + ( frameGenerationPending ? 0 : frameGenerationOutputInterval ),
+								frameGenerationOutputInterval );
+						}
 						else
 							reset_frame_generation_output_timer();
 					}
