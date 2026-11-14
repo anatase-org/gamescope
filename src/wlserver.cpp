@@ -175,6 +175,13 @@ ResListEntry_t PrepareCommit( struct wlr_surface *surf, struct wlr_buffer *buf, 
 		std::move( pReleasePoint ),
 		std::move( damage )
 	};
+	newEntry.damageExtents = *pixman_region32_extents( &surf->buffer_damage );
+	if ( wl_surf->x11_surface && wl_surf->x11_surface->override_surface && wl_surf->x11_surface->override_surface != surf )
+	{
+		int nRects = 0;
+		const pixman_box32_t *rects = pixman_region32_rectangles( &surf->buffer_damage, &nRects );
+		newEntry.damageRects.assign( rects, rects + nRects );
+	}
 	wl_surf->present_id = std::nullopt;
 	wl_surf->desired_present_time = 0;
 	wl_surf->pending_presentation_feedbacks.clear();

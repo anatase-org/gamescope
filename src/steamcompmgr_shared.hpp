@@ -1,6 +1,7 @@
 #pragma once
 
 #include <variant>
+#include <array>
 #include <string>
 #include <utility>
 
@@ -8,9 +9,24 @@
 
 #include "xwayland_ctx.hpp"
 #include "gamescope-control-protocol.h"
+#include "Timeline.h"
+
+class CVulkanTexture;
 
 struct commit_t;
 struct wlserver_vk_swapchain_feedback;
+
+struct PooledImage_t
+{
+	gamescope::OwningRc<CVulkanTexture> pTexture;
+	// Tracks imported producer fences and completion of writes to this image.
+	std::shared_ptr<gamescope::CTimeline> pReleaseTimeline;
+	uint64_t ulLastPoint = 0ul;
+	// Independent producer timelines: a later blit fence must not satisfy the
+	// base-image wait when dependencies on one Vulkan semaphore are coalesced.
+	std::array<std::shared_ptr<gamescope::CTimeline>, 2> producerTimelines;
+	std::array<uint64_t, 2> producerPoints{};
+};
 
 struct wlserver_x11_surface_info
 {
@@ -76,7 +92,19 @@ struct steamcompmgr_xwayland_win_t
 
 	Window transientFor;
 
-	struct wlserver_x11_surface_info surface;
+	struct PooledImage_t
+{
+	gamescope::OwningRc<CVulkanTexture> pTexture;
+	// Tracks imported producer fences and completion of writes to this image.
+	std::shared_ptr<gamescope::CTimeline> pReleaseTimeline;
+	uint64_t ulLastPoint = 0ul;
+	// Independent producer timelines: a later blit fence must not satisfy the
+	// base-image wait when dependencies on one Vulkan semaphore are coalesced.
+	std::array<std::shared_ptr<gamescope::CTimeline>, 2> producerTimelines;
+	std::array<uint64_t, 2> producerPoints{};
+};
+
+struct wlserver_x11_surface_info surface;
 
 	xwayland_ctx_t *ctx;
 };
@@ -166,6 +194,8 @@ struct steamcompmgr_win_t {
 	std::shared_ptr<std::string> engineName;
 
 	std::vector< gamescope::Rc<commit_t> > commit_queue;
+	std::vector<PooledImage_t> overrideBlitImages;
+	std::vector<pixman_box32_t> overrideBlitPendingDamage;
 	std::shared_ptr<std::vector< uint32_t >> icon;
 
 	steamcompmgr_win_type_t		type;

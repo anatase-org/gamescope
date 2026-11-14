@@ -198,6 +198,7 @@ public:
 	inline bool colorAttachment() const { return m_bColorAttachment; }
 	inline bool storageImage() const { return m_bStorage; }
 	inline VkImageUsageFlags usage() const { return m_usage; }
+	inline bool transferSrc() const { return (m_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || (linearSource && linearSource->transferSrc()); }
 	inline bool externalImage() { return m_bExternal; }
 	inline VkDeviceSize totalSize() const { return m_size; }
 	inline uint32_t drmFormat() const { return m_drmFormat; }
@@ -1213,6 +1214,7 @@ public:
 	void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1);
 	void drawComposite(const FrameInfo_t *frame, EOTF outputTF, CompositeShaderConfig_t config, bool copyBase);
 	void copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::optional<VkRect2D> region = std::nullopt);
+	void copyImageRegions(gamescope::Rc<CVulkanTexture> src, gamescope::Rc<CVulkanTexture> dst, std::span<const VkImageCopy> regions, bool discard = false);
 	void copyImageToReadback(gamescope::Rc<CVulkanTexture> src);
 	void copyBufferToImage(VkBuffer buffer, VkDeviceSize offset, uint32_t stride, gamescope::Rc<CVulkanTexture> dst);
 
@@ -1228,6 +1230,7 @@ public:
 
 	bool AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 	bool AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
+	void AddReleasePoint(std::shared_ptr<gamescope::CReleaseTimelinePoint> point) { m_releasePointRefs.emplace_back(std::move(point)); }
 
 	const std::vector<VulkanTimelinePoint_t> &GetExternalDependencies() const { return m_ExternalDependencies; }
 	const std::vector<VulkanTimelinePoint_t> &GetExternalSignals() const { return m_ExternalSignals; }

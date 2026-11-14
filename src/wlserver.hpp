@@ -52,6 +52,8 @@ struct ResListEntry_t {
 	std::shared_ptr<gamescope::CAcquireTimelinePoint> pAcquirePoint;
 	std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint;
 	SurfaceDamage damage;
+	pixman_box32_t damageExtents{};
+	std::vector<pixman_box32_t> damageRects;
 };
 
 // A commit for a surface that is not a toplevel. These are composited as part
