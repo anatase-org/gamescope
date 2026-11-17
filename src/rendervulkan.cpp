@@ -5779,6 +5779,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	for ( int i = 0; i < frameInfo->layers.count(); i++ )
 	{
 		const FrameInfo_t::Layer_t &layer = frameInfo->layers.get( i );
+		if ( layer.releasePoint )
+			cmdBuffer->AddReleasePoint( layer.releasePoint );
 		if ( layer.acquirePoint && !cmdBuffer->AddDependency(
 			layer.acquirePoint->GetTimeline()->ToVkSemaphore(), layer.acquirePoint->GetPoint() ) )
 			return std::nullopt;
@@ -6301,6 +6303,14 @@ namespace
 			}
 
 			auto cmdBuffer = g_device.commandBuffer();
+			if ( realLayer.releasePoint )
+				cmdBuffer->AddReleasePoint( realLayer.releasePoint );
+			if ( realLayer.acquirePoint && !cmdBuffer->AddDependency(
+					realLayer.acquirePoint->GetTimeline()->ToVkSemaphore(), realLayer.acquirePoint->GetPoint() ) )
+			{
+				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
+				return;
+			}
 			const bool reset = !m_hasHistory;
 			if ( !vulkan_frame_generation_record_optical_flow(
 					cmdBuffer.get(), rawSource, realLayer.colorspace,
@@ -6328,7 +6338,7 @@ namespace
 				vulkan_frame_generation_notify_submit( sequence );
 				m_hasHistory = true;
 				m_previousReal = {
-					realLayer, false, frameInfo->useFSRLayer0, nullptr,
+					realLayer, false, frameInfo->useFSRLayer0, realLayer.acquirePoint,
 					m_currentRealOutputId };
 				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::WarmingUp );
 				return;
@@ -6371,7 +6381,7 @@ namespace
 			generated.useFSR = false;
 			generated.outputId = ++m_nextOutputId;
 			FrameGenerationQueuedFrame real = {
-				realLayer, false, frameInfo->useFSRLayer0, nullptr,
+				realLayer, false, frameInfo->useFSRLayer0, realLayer.acquirePoint,
 				m_currentRealOutputId };
 			const bool hdrOutput = ColorspaceIsHDR( realLayer.colorspace );
 
@@ -6379,6 +6389,7 @@ namespace
 			if ( abDuplicate )
 			{
 				generated.layer = realLayer;
+				generated.acquirePoint = realLayer.acquirePoint;
 				vulkan_frame_generation_record_output_timestamp( cmdBuffer.get(), false );
 				sequence = g_device.submit( std::move( cmdBuffer ) );
 			}
@@ -6408,6 +6419,7 @@ namespace
 				if ( ColorspaceIsHDR( realLayer.colorspace ) )
 					generatedFrame.layers[0].colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SCRGB;
 				generatedFrame.layers[0].acquirePoint = nullptr;
+				generatedFrame.layers[0].releasePoint = nullptr;
 				generatedFrame.layers[0].opacity = 1.0f;
 				generatedFrame.useFSRLayer0 = fsrEnabled && !frameInfo->useSGSRLayer0;
 				generatedFrame.useSGSRLayer0 = fsrEnabled && frameInfo->useSGSRLayer0;
@@ -6540,6 +6552,7 @@ namespace
 				}
 
 				generated.layer.tex = scanout;
+				generated.layer.releasePoint = nullptr;
 				if ( generatedFrame.applyOutputColorMgmt && generatedFrame.outputEncodingEOTF == EOTF_Gamma22 )
 				{
 					generated.layer.colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
@@ -6590,7 +6603,6 @@ namespace
 					FrameInfo_t realFrame = {};
 					realFrame.layers.push();
 					realFrame.layers[0] = realLayer;
-					realFrame.layers[0].acquirePoint = nullptr;
 					realFrame.layers[0].opacity = 1.0f;
 					realFrame.useFSRLayer0 = fsrEnabled && !frameInfo->useSGSRLayer0;
 					realFrame.useSGSRLayer0 = fsrEnabled && frameInfo->useSGSRLayer0;
@@ -6635,6 +6647,7 @@ namespace
 						return;
 					}
 					real.layer.tex = realScanout;
+					real.layer.releasePoint = nullptr;
 					if ( fsrEnabled )
 					{
 						real.layer.scale = { 1.0f, 1.0f };

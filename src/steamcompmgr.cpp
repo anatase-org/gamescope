@@ -2200,6 +2200,11 @@ paint_cached_base_layer(const gamescope::Rc<commit_t>& commit, const BaseLayerIn
 	layer->opacity = bOverrideOpacity ? flOpacityScale : base.opacity * flOpacityScale;
 
 	layer->tex = commit->GetTexture( base.eUpscaleFilter, base.eUpscaleScaler, layer->colorspace );
+	if ( layer->tex == commit->vulkanTex )
+	{
+		layer->acquirePoint = commit->pAcquirePoint;
+		layer->releasePoint = commit->releasePoint;
+	}
 	layer->filter = base.filter;
 	if ( layer->tex == commit->vulkanTex )
 	{
@@ -2517,6 +2522,11 @@ paint_window_commit( const gamescope::Rc<commit_t> &lastCommit, steamcompmgr_win
 	layer->filter = ( flags & PaintWindowFlag::NoFilter ) ? GamescopeUpscaleFilter::LINEAR : frameInfo->eUpscaleFilter;
 
 	layer->tex = lastCommit->GetTexture( layer->filter, frameInfo->eUpscaleScaler, layer->colorspace );
+	if ( layer->tex == lastCommit->vulkanTex )
+	{
+		layer->acquirePoint = lastCommit->pAcquirePoint;
+		layer->releasePoint = lastCommit->releasePoint;
+	}
 	layer->damage = lastCommit->damage;
 
 	WindowTransform_t transform = compute_window_transform( lastCommit, w, scaleW, frameInfo, layer->tex, cursor, flags, fit );

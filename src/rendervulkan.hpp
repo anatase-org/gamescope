@@ -382,6 +382,9 @@ struct FrameInfo_t
 		std::shared_ptr<gamescope::BackendBlob> ctm;
 		std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
 		std::shared_ptr<gamescope::CAcquireTimelinePoint> acquirePoint;
+		// A Vulkan-only import has no backend framebuffer to retain this point.
+		// Keep the producer from reusing it while a layer is queued for framegen.
+		std::shared_ptr<gamescope::CReleaseTimelinePoint> releasePoint;
 		// Borrowed for the duration of a backend Present call.
 		int acquireFenceFd = -1;
 
