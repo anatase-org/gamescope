@@ -6602,8 +6602,8 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
 				vulkan_frame_generation_note_source_callback( true );
 			return false;
 		}
-		// Source callbacks own the cadence. Latch a ready source while the previous
-		// midpoint is queued so generation can run ahead of scanout.
+		// The client can render ahead, but its next commit waits for the
+		// previous midpoint and real frame to reach the backend.
 		if ( !frameCallback )
 			return true;
 		const uint64_t schedule = w->last_commit_first_latch_time +
@@ -10881,7 +10881,7 @@ steamcompmgr_main(int argc, char **argv)
 
 			if ( frameGenerationFreeRunning )
 			{
-				if ( frameGenerationPending &&
+				if ( ( frameGenerationPending || s_uFrameGenerationOutputDeadline != 0 ) &&
 					( s_uFrameGenerationOutputDeadline == 0 ||
 					  s_uFrameGenerationOutputInterval != frameGenerationOutputInterval ) )
 				{
@@ -10895,13 +10895,13 @@ steamcompmgr_main(int argc, char **argv)
 			}
 
 			const bool frameGenerationTimerOutputDue = frameGenerationFreeRunning &&
-				frameGenerationPending && s_bFrameGenerationOutputTimerDue;
+				s_bFrameGenerationOutputTimerDue;
 			const bool frameGenerationVblankOutputDue = bFrameGeneration &&
 				!frameGenerationFreeRunning && vblank &&
 				gamescope::FrameGenerationRationalSlotCrossed(
 					s_ulPrevVBlankIdx, vblank_idx, frameGenerationOutputFPS, frameGenerationRefreshHz );
 			if ( frameGenerationVblankOutputDue )
-				vulkan_frame_generation_note_output_slot( frameGenerationPending );
+				vulkan_frame_generation_note_output_slot( frameGenerationPending, hasRepaint );
 
 			if ( frameGenerationTimerOutputDue &&
 				vulkan_frame_generation_drop_stale_generated_frame(
@@ -11011,10 +11011,10 @@ steamcompmgr_main(int argc, char **argv)
 				}
 			}
 
-			const bool frameGenerationPrepareOnly = bFrameGeneration && hasRepaint &&
+			const bool frameGenerationPrepareOnly = bFrameGeneration && hasRepaint && !frameGenerationPending &&
 				( frameGenerationFreeRunning
-					? frameGenerationPending && !frameGenerationTimerOutputDue
-					: !vblank );
+					? !bShouldPaint || ( s_uFrameGenerationOutputDeadline != 0 && !frameGenerationTimerOutputDue )
+					: !frameGenerationVblankOutputDue );
 			if ( frameGenerationPrepareOnly )
 				bShouldPaint = true;
 
@@ -11031,16 +11031,15 @@ steamcompmgr_main(int argc, char **argv)
 					g_bDPMS_set = g_bDPMS;
 					bPainted = true;
 
+					if ( frameGenerationPending && !vulkan_frame_generation_has_pending_frame() )
+						nudge_steamcompmgr(); // Latch the next source while the real flip is in flight.
+
 					if ( frameGenerationFreeRunning )
 					{
-						if ( vulkan_frame_generation_has_pending_frame() )
-						{
-							schedule_frame_generation_output_timer(
-								get_time_in_nanos(),
-								frameGenerationOutputInterval );
-						}
-						else
-							reset_frame_generation_output_timer();
+						// The queue drains after each real frame. Keep its next output
+						// deadline so a new pair can prepare without presenting early.
+						schedule_frame_generation_output_timer(
+							get_time_in_nanos(), frameGenerationOutputInterval );
 					}
 				}
 			}

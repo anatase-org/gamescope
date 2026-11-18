@@ -44,12 +44,9 @@ namespace gamescope
 			( queuedFrames == 2u && frontFrameGenerated );
 	}
 
-	constexpr bool FrameGenerationCanAcceptSourceFrame(
-		uint32_t queuedFrames, bool frontFrameGenerated )
+	constexpr bool FrameGenerationCanAcceptSourceFrame( uint32_t queuedFrames )
 	{
-		return queuedFrames == 0u ||
-			( queuedFrames == 1u && !frontFrameGenerated ) ||
-			( queuedFrames == 2u && frontFrameGenerated );
+		return queuedFrames == 0u;
 	}
 
 	constexpr bool FrameGenerationShouldPrecomposeRealFrame(

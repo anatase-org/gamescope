@@ -74,18 +74,17 @@ int main()
 	assert( FrameGenerationRationalSlotCrossed( 4, 6, 90, 240 ) );
 	assert( !FrameGenerationRationalSlotCrossed( 1, 2, 0, 120 ) );
 
-	// Let the client begin its next frame on the midpoint slot. Commit latching
-	// remains blocked separately until the midpoint drains, leaving one real.
+	// The client can render ahead while both frames wait for submission.
 	assert( FrameGenerationCanRequestSourceFrame( 0, false ) );
 	assert( FrameGenerationCanRequestSourceFrame( 2, true ) );
 	assert( !FrameGenerationCanRequestSourceFrame( 1, true ) );
 	assert( FrameGenerationCanRequestSourceFrame( 1, false ) );
 	assert( !FrameGenerationCanRequestSourceFrame( 3, true ) );
 
-	assert( FrameGenerationCanAcceptSourceFrame( 0, false ) );
-	assert( FrameGenerationCanAcceptSourceFrame( 1, false ) );
-	assert( !FrameGenerationCanAcceptSourceFrame( 1, true ) );
-	assert( FrameGenerationCanAcceptSourceFrame( 2, true ) );
+	// Starting the next pair requires both images to have left the queue.
+	assert( FrameGenerationCanAcceptSourceFrame( 0 ) );
+	assert( !FrameGenerationCanAcceptSourceFrame( 1 ) );
+	assert( !FrameGenerationCanAcceptSourceFrame( 2 ) );
 
 	assert( FrameGenerationShouldPrecomposeRealFrame( true, false, true ) );
 	assert( FrameGenerationShouldPrecomposeRealFrame( false, true, true ) );

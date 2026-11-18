@@ -600,7 +600,7 @@ struct FrameGenerationTelemetry
 };
 FrameGenerationTelemetry vulkan_frame_generation_get_telemetry();
 void vulkan_frame_generation_note_source_callback( bool blocked );
-void vulkan_frame_generation_note_output_slot( bool hasPendingFrame );
+void vulkan_frame_generation_note_output_slot( bool hasPendingFrame, bool hasNewSource );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
