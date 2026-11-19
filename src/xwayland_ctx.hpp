@@ -5,6 +5,8 @@
 
 #include <mutex>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <X11/Xlib.h>
@@ -88,6 +90,15 @@ struct xwayland_ctx_t final : public gamescope::IWaitable
 	focus_t 		focus;
 	Window 			currentKeyboardFocusWindow;
 	Window			focusControlWindow;
+
+	struct EdidPropertyState
+	{
+		std::string filename;
+		std::string contents;
+
+		bool operator==( const EdidPropertyState & ) const = default;
+	};
+	std::optional<EdidPropertyState> publishedEdid;
 
 	std::unique_ptr<MouseCursor> cursor;
 

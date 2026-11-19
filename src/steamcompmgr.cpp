@@ -9512,9 +9512,28 @@ void update_edid_prop()
 			filename = pszVirtualEdid;
 	}
 
+	// Steam treats every PropertyNotify as a display change, even if the path
+	// is unchanged. Compare the file too: a new display can replace the EDID
+	// at the same path. Failed reads leave the last publication intact.
+	std::ifstream edidFile( filename, std::ios::binary );
+	if ( !edidFile )
+		return;
+
+	xwayland_ctx_t::EdidPropertyState edidState
+	{
+		.filename = filename,
+		.contents = std::string( std::istreambuf_iterator<char>{ edidFile }, {} ),
+	};
+	if ( edidFile.bad() || edidState.contents.empty() )
+		return;
+
 	gamescope_xwayland_server_t *server = NULL;
 	for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
 	{
+		// Cache per context so a newly created Xwayland gets an initial value.
+		if ( server->ctx->publishedEdid == edidState )
+			continue;
+
 		XTextProperty text_property =
 		{
 			.value = (unsigned char *)filename,
@@ -9524,6 +9543,7 @@ void update_edid_prop()
 		};
 
 		XSetTextProperty( server->ctx->dpy, server->ctx->root, &text_property, server->ctx->atoms.gamescopeDisplayEdidPath );
+		server->ctx->publishedEdid = edidState;
 	}
 }
 
