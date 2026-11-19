@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
+#include "Utils/Defer.h"
 
 #if defined(__linux__)
 #include <sys/sysmacros.h>
@@ -1953,11 +1954,72 @@ std::shared_ptr<VulkanTimelineSemaphore_t> CVulkanDevice::ImportTimelineSemaphor
 	};
 	if ( ( res = vk.ImportSemaphoreFdKHR( m_device, &importFdInfo ) ) != VK_SUCCESS )
 	{
+		// Vulkan takes ownership only on a successful import.
+		close( importFdInfo.fd );
 		vk_errorf( res, "vkImportSemaphoreFdKHR failed" );
 		return nullptr;
 	}
 
 	return pSemaphore;
+}
+
+std::optional<VulkanTimelinePoint_t> CVulkanDevice::GetAcquireWait( const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pPoint )
+{
+	if ( !pPoint )
+		return VulkanTimelinePoint_t{};
+
+	// Timelines created by this Vulkan device already have a compatible handle.
+	if ( auto pSemaphore = pPoint->GetTimeline()->GetCachedVkSemaphore() )
+		return VulkanTimelinePoint_t{ std::move( pSemaphore ), pPoint->GetPoint() };
+
+	// Toplevel commits normally arrive here after the image waiter signalled.
+	if ( pPoint->Wait( 0 ) )
+		return VulkanTimelinePoint_t{};
+
+	// DRM syncobj FDs are not portable Vulkan OPAQUE_FD handles (notably on
+	// NVIDIA). Export this point as a sync_file and wait on a binary semaphore.
+	int nFd = pPoint->CreateSyncFile();
+	if ( nFd < 0 )
+		return std::nullopt;
+	defer( if ( nFd >= 0 ) close( nFd ); );
+
+	auto pSemaphore = std::make_shared<VulkanTimelineSemaphore_t>();
+	pSemaphore->pDevice = this;
+	const VkSemaphoreCreateInfo createInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	};
+	VkResult res = vk.CreateSemaphore( m_device, &createInfo, nullptr, &pSemaphore->pVkSemaphore );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkCreateSemaphore for acquire sync_file failed" );
+		return std::nullopt;
+	}
+
+	const VkImportSemaphoreFdInfoKHR importInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+		.semaphore = pSemaphore->pVkSemaphore,
+		.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		.fd = nFd,
+	};
+	res = vk.ImportSemaphoreFdKHR( m_device, &importInfo );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkImportSemaphoreFdKHR for acquire sync_file failed" );
+		return std::nullopt;
+	}
+	nFd = -1; // The Vulkan implementation owns the imported descriptor.
+	return VulkanTimelinePoint_t{ std::move( pSemaphore ), 0 };
+}
+
+bool CVulkanCmdBuffer::AddDependency( const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pPoint )
+{
+	auto wait = m_device->GetAcquireWait( pPoint );
+	if ( !wait )
+		return false;
+	return !wait->pTimelineSemaphore || AddDependency( std::move( wait->pTimelineSemaphore ), wait->ulPoint );
 }
 
 bool CVulkanCmdBuffer::AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
@@ -5781,8 +5843,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		const FrameInfo_t::Layer_t &layer = frameInfo->layers.get( i );
 		if ( layer.releasePoint )
 			cmdBuffer->AddReleasePoint( layer.releasePoint );
-		if ( layer.acquirePoint && !cmdBuffer->AddDependency(
-			layer.acquirePoint->GetTimeline()->ToVkSemaphore(), layer.acquirePoint->GetPoint() ) )
+		if ( !cmdBuffer->AddDependency( layer.acquirePoint ) )
 			return std::nullopt;
 	}
 
@@ -6328,8 +6389,7 @@ namespace
 			auto cmdBuffer = g_device.commandBuffer();
 			if ( realLayer.releasePoint )
 				cmdBuffer->AddReleasePoint( realLayer.releasePoint );
-			if ( realLayer.acquirePoint && !cmdBuffer->AddDependency(
-					realLayer.acquirePoint->GetTimeline()->ToVkSemaphore(), realLayer.acquirePoint->GetPoint() ) )
+			if ( !cmdBuffer->AddDependency( realLayer.acquirePoint ) )
 			{
 				gamescope::SetFrameGenerationStatus( gamescope::FrameGenerationStatus::UnsupportedGPU );
 				return;

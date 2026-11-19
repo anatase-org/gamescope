@@ -8188,10 +8188,7 @@ static std::optional<VulkanTimelinePoint_t> GetBufferWait( PooledImage_t &image,
 {
 	if ( pAcquirePoint )
 	{
-		auto semaphore = pAcquirePoint->GetTimeline()->ToVkSemaphore();
-		if ( !semaphore )
-			return std::nullopt;
-		return VulkanTimelinePoint_t{ std::move(semaphore), pAcquirePoint->GetPoint() };
+		return g_device.GetAcquireWait( pAcquirePoint );
 	}
 
 	struct wlr_dmabuf_attributes dmabuf = {0};
@@ -8507,7 +8504,7 @@ void update_wayland_res(const std::shared_ptr<CommitDoneList_t> &doneCommits, st
 				const uint64_t ulNextReleasePoint = pTempImage->ulLastPoint + 1;
 
 				std::unique_ptr<CVulkanCmdBuffer> pCommandBuffer = g_device.commandBuffer();
-				if ( !pCommandBuffer->AddDependency( newCommit->pAcquirePoint->GetTimeline()->ToVkSemaphore(), newCommit->pAcquirePoint->GetPoint() ) ||
+				if ( !pCommandBuffer->AddDependency( newCommit->pAcquirePoint ) ||
 				     !pCommandBuffer->AddSignal( pTempImage->pReleaseTimeline->ToVkSemaphore(), ulNextReleasePoint ) )
 				{
 					bPreemptiveUpscale = false;

@@ -1045,6 +1045,7 @@ public:
 
 	std::shared_ptr<VulkanTimelineSemaphore_t> CreateTimelineSemaphore( uint64_t ulStartingPoint, bool bShared = false );
 	std::shared_ptr<VulkanTimelineSemaphore_t> ImportTimelineSemaphore( gamescope::CTimeline *pTimeline );
+	std::optional<VulkanTimelinePoint_t> GetAcquireWait( const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pPoint );
 
 	static const uint32_t upload_buffer_size = 1920 * 1080 * 4;
 
@@ -1235,6 +1236,7 @@ public:
 	uint32_t queueFamily() { return m_queueFamily; }
 
 	bool AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
+	bool AddDependency( const std::shared_ptr<gamescope::CAcquireTimelinePoint> &pPoint );
 	bool AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint );
 	void AddReleasePoint(std::shared_ptr<gamescope::CReleaseTimelinePoint> point) { m_releasePointRefs.emplace_back(std::move(point)); }
 
